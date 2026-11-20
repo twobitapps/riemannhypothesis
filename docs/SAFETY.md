@@ -45,7 +45,8 @@ Lean code can run programs while it compiles (`#eval`, `run_cmd`,
 - **Your private context never enters swarm work.** Lanes run in an empty
   temporary directory with your personal setup switched off:
   - Claude Code: `claude -p --tools "" --strict-mcp-config --setting-sources ""
-    --no-session-persistence`, in an empty directory. Verified: no tools, no
+    --no-session-persistence --settings '{"autoMemoryEnabled":false}'`
+    with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, in an empty directory. Verified: no tools, no
     MCP servers, no CLAUDE.md, no memory, no saved session. (`--bare` is not
     usable: it also drops the subscription login.) Claude Code still shows the
     model the account email, so every output is screened (below).

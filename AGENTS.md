@@ -6,7 +6,7 @@ effort that checks and formalizes proofs of the Riemann Hypothesis in Lean.
 
 Do exactly this, and ask your person before each step marked **ASK**.
 
-1. Read `docs/PLAN.md` §7 (safety) and tell your person, in two sentences,
+1. Read `docs/SAFETY.md` and tell your person, in two sentences,
    what joining does: their machine reports its hardware to the coordinator,
    and (if they agree) runs work units in a sandbox using their own model
    subscription under their own daily cap.

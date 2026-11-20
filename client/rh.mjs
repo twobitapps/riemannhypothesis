@@ -18,7 +18,7 @@
 //   node rh.mjs bye                     tell the coordinator this machine left
 //   node rh.mjs leave --purge           bye, then delete ~/.riemann entirely
 //
-// Lanes: `claude -p --tools "" --strict-mcp-config --setting-sources ""
+// Lanes: `claude -p --tools "" --strict-mcp-config --setting-sources "" (auto-memory off)
 // --no-session-persistence --output-format json` in an empty directory under
 // ~/.riemann/work, with API-key variables removed (subscription only). One lane
 // at a time, a daily cap in lane-minutes (--cap, default 60), paused on battery,
@@ -294,7 +294,7 @@ const IDLE_SECONDS = 300;
 
 // ---------- the lane: one tool-less Claude Code call ----------
 
-const LANE_ARGS = ['-p', '--tools', '', '--strict-mcp-config', '--setting-sources', '', '--no-session-persistence', '--output-format', 'json'];
+const LANE_ARGS = ['-p', '--tools', '', '--strict-mcp-config', '--setting-sources', '', '--settings', '{"autoMemoryEnabled":false}', '--no-session-persistence', '--output-format', 'json'];
 const STRIP_ENV = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'OPENAI_API_KEY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
   'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT'];
 const LANE_TIMEOUT_MS = 10 * 60_000;
@@ -303,6 +303,7 @@ const LIMIT_RE = /usage limit|rate limit|limit reached|hit your (?:usage )?limit
 function laneEnv() {
   const env = { ...process.env };
   for (const k of STRIP_ENV) delete env[k];
+  env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'; // no memory directory in the lane's context
   return env;
 }
 
