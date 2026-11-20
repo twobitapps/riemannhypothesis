@@ -20,7 +20,7 @@ export const metadata = {
   metadataBase: new URL('https://riemannhypothesis.vercel.app'),
   title: 'The Riemann Hypothesis',
   description: 'An agentic swarm to check two proofs.',
-  robots: { index: false, follow: false },
+  robots: { index: true, follow: true },
   openGraph: { title: OG_TITLE, description: OG_DESC, url: '/', siteName: 'The Riemann Hypothesis', type: 'website', images: [ogImage] },
   twitter: { card: 'summary_large_image', title: OG_TITLE, description: OG_DESC, images: [ogImage] },
 };

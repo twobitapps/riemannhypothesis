@@ -127,14 +127,15 @@ function Feed({ now }) {
           ))}
         </div>
         {shownTopics.length > 0 && (
-          <div className="choice bd-topics" role="group" aria-label="Topic">
-            <button type="button" className={!topic ? 'on' : ''} onClick={() => setTopic('')}>every topic</button>
-            {shownTopics.map((t) => (
-              <button key={t.slug} type="button" className={topic === t.slug ? 'on' : ''} onClick={() => setTopic(topic === t.slug ? '' : t.slug)} title={`${t.posts} posts`}>
-                {t.title || t.slug}
-              </button>
-            ))}
-          </div>
+          <label className="bd-qsel">
+            <span>Question</span>
+            <select value={topic} onChange={(e) => setTopic(e.target.value)}>
+              <option value="">All open questions</option>
+              {shownTopics.map((t) => (
+                <option key={t.slug} value={t.slug}>{t.title || t.slug}</option>
+              ))}
+            </select>
+          </label>
         )}
         <div className="choice bd-order" role="group" aria-label="Order">
           <button type="button" className={!ranked ? 'on' : ''} onClick={() => setRanked(false)}>newest</button>
@@ -227,16 +228,18 @@ function Thread({ id, now }) {
 function Mark({ post }) {
   const l = labelOf(post);
   if (!l) return null;
-  return <span className="at-mark bd-mark" title={`${l.name}: ${l.note}`} aria-label={l.name}>{l.mark}</span>;
+  return <span className="at-mark bd-mark" title={`${l.name}: ${l.note}`} aria-label={l.name}>{l.mark} <span className="bd-mark-note">{l.note}</span></span>;
 }
 
 function Post({ post, now, brief = false, reply = false }) {
   const paras = shapeBody(post.body);
   const shown = brief ? paras.slice(0, 1) : paras;
-  const more = brief && paras.length > 1;
+  const more = brief;
   const href = `/board?p=${post.id}`;
   const ah = authorHref(post);
   const refs = (post.refs || []).map(parseRef);
+  const compact = compactRefs(refs, brief ? 4 : 12);
+  const title = String(post.title || '').replace(/^card:\s*/i, '');
 
   return (
     <article className={'bd-post' + (reply ? ' bd-reply' : '')} id={post.id}>
@@ -246,28 +249,29 @@ function Post({ post, now, brief = false, reply = false }) {
         {post.topic && <span className="bd-topic">{post.topic}</span>}
         <Mark post={post} />
       </p>
-      <h3 className="bd-title">{brief || reply ? <Link href={href} scroll={false}>{post.title}</Link> : post.title}</h3>
+      <h3 className="bd-title">{brief || reply ? <Link href={href} scroll={false}>{title}</Link> : title}</h3>
       {shown.length > 0 && (
-        <div className="bd-body">
+        <div className={'bd-body' + (brief ? ' bd-brief' : '')}>
           {shown.map((segs, i) => (
             <div key={i} className="bd-p">
               {segs.map((s, j) => (s.t === 'text' ? <span key={j}>{s.v}</span> : <Tex key={j} src={s.v} display={s.t === 'display'} className={s.t === 'display' ? 'bd-dmath' : 'bd-imath'} />))}
-              {more && i === shown.length - 1 && <> <Link href={href} scroll={false} className="bd-more">more</Link></>}
             </div>
           ))}
         </div>
       )}
+      {more && shown.length > 0 && <p className="bd-morelink"><Link href={href} scroll={false} className="bd-more">Read</Link></p>}
       {post.lean && <pre className="bd-lean mono">{post.lean}</pre>}
-      {refs.length > 0 && (
+      {compact.shown.length > 0 && (
         <p className="bd-refs">
-          <span>refs</span>
-          {refs.map((r, i) =>
+          <span>Refs</span>
+          {compact.shown.map((r, i) =>
             r.href ? (
-              <Link key={r.id + i} href={r.href} scroll={false} className="mono">{r.text}</Link>
+              <Link key={r.id + i} href={r.href} scroll={false} title={r.full}>{r.label}</Link>
             ) : (
-              <span key={r.id + i} className="mono">{r.text}</span>
+              <span key={r.id + i} className="ref" title={r.full}>{r.label}</span>
             ),
           )}
+          {compact.extra > 0 && <span className="ref-more">+{compact.extra} more</span>}
         </p>
       )}
       <p className="bd-meta">
@@ -287,4 +291,64 @@ function Post({ post, now, brief = false, reply = false }) {
       </p>
     </article>
   );
+}
+
+/* ── home-page live strip: newest posts, no filters ───────────────── */
+
+export function LiveBoard({ limit = 8 }) {
+  const now = useNow();
+  const [posts, setPosts] = useState(null);
+  const seq = useRef(0);
+
+  useEffect(() => {
+    let alive = true;
+    const ctl = new AbortController();
+    let timer;
+    const tick = async (first) => {
+      if (first || typeof document === 'undefined' || !document.hidden) {
+        try {
+          const d = await getJSON(boardQuery(first ? { limit } : { since: seq.current }), ctl.signal);
+          if (!alive) return;
+          if (first) setPosts(mergePosts([], d.posts, false).slice(0, limit));
+          else if (d.posts?.length) setPosts((prev) => mergePosts(prev || [], d.posts, false).slice(0, limit));
+          seq.current = Math.max(seq.current, Number(d.seq) || 0, maxSeq(d.posts));
+        } catch (e) {
+          if (alive && e.name !== 'AbortError' && first) setPosts([]);
+        }
+      }
+      if (alive) timer = setTimeout(() => tick(false), POLL_MS);
+    };
+    tick(true);
+    return () => { alive = false; ctl.abort(); clearTimeout(timer); };
+  }, [limit]);
+
+  if (!posts || posts.length === 0) return null;
+  return (
+    <div className="bd-feed bd-live">
+      <ol className="bd-list">
+        {posts.map((post) => (
+          <li key={post.id}><Post post={post} now={now} brief /></li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+
+/* Refs: posts first, then modules by short name; unit refs fold into their module. */
+function compactRefs(refs, max) {
+  const seen = new Set();
+  const out = [];
+  for (const r of refs) {
+    const key = r.module || r.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (r.type === 'post') out.push({ ...r, label: r.id, full: r.id, rank: 0 });
+    else if (r.module) {
+      const parts = r.module.split('.');
+      out.push({ ...r, label: parts.slice(-2).join('.'), full: r.module, rank: 1 });
+    } else out.push({ ...r, label: r.text, full: r.text, rank: 2 });
+  }
+  out.sort((a, b) => a.rank - b.rank);
+  return { shown: out.slice(0, max), extra: Math.max(0, out.length - max) };
 }

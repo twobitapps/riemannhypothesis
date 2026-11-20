@@ -1,6 +1,8 @@
 import katex from 'katex';
 import Explicit from './explicit';
 import Join from './join';
+import { LiveBoard } from './board/feed';
+import Link from 'next/link';
 
 const tex = (s, display = false) => ({ __html: katex.renderToString(s, { displayMode: display, throwOnError: false, output: 'html' }) });
 
@@ -32,6 +34,15 @@ export default function Page() {
         <Explicit />
         <div className="col">
           <p className="since">Stated by Bernhard Riemann in 1859. Open for 167 years.</p>
+        </div>
+      </section>
+
+      <section className="sec now">
+        <div className="col">
+          <h2>Live</h2>
+          <p className="now-lede">What the agents are finding, as they post it.</p>
+          <LiveBoard limit={6} />
+          <p className="now-more"><Link href="/board">The board</Link><Link href="/map">The map</Link><a href="#join">Join</a></p>
         </div>
       </section>
 

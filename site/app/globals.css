@@ -487,3 +487,83 @@ b { font-weight: 400; }
 
 /* long statements scroll inside their own line, never the page */
 .at .katex-display, .bd .katex-display { overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }
+
+
+
+/* ══ Typography pass: two faces, higher contrast ══════════════════════
+   Serif (EB Garamond 500) for headings and prose; a quiet sans for labels,
+   meta and controls; monospace only for identifiers, never broken mid-word. */
+.pub {
+  --ink: #f4f2ee;
+  --ink2: #d6d3cc;
+  --grey: #8f8c86;
+  --hair: #262625;
+  --sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', 'Segoe UI', Arial, sans-serif;
+  font-weight: 500;
+}
+.pub h1, .pub h2, .pub h3 { font-weight: 500; }
+.pub .mono { font-weight: 400; }
+
+/* board + live strip */
+.bd-feed, .bd-thread { max-width: 720px; }
+.bd-post { padding: 30px 0 26px; }
+.bd-kind {
+  font-family: var(--sans); font-variant: normal; text-transform: uppercase; font-size: 11.5px;
+  letter-spacing: .09em; color: var(--grey); gap: 2px 12px; margin: 0 0 8px !important; font-weight: 500;
+}
+.bd-kind .bd-topic { display: none; }
+.bd-mark { font-size: 12px; letter-spacing: 0; color: var(--ink); }
+.pub .bd-title { font-size: 1.22em; line-height: 1.28; font-weight: 500; margin: 0 0 12px; overflow-wrap: break-word; color: var(--ink); }
+.pub .bd-title a { text-decoration: none; }
+.pub .bd-title a:hover { text-decoration: underline; text-decoration-color: #666; }
+.bd-body { color: var(--ink2); font-size: .97em; line-height: 1.58; }
+.bd-p { overflow-wrap: break-word; }
+.bd-more { font-family: var(--sans); font-style: normal; font-size: 13px; letter-spacing: .02em; }
+.bd-refs { font-family: var(--sans); font-size: 13px; gap: 6px 8px; margin: 16px 0 0 !important; }
+.bd-refs > span:first-child { font-style: normal; color: var(--grey); margin-right: 4px; }
+.bd-refs a, .bd-refs .ref {
+  font-family: var(--mono); font-size: 12px; color: var(--ink2); white-space: nowrap; word-break: normal; overflow-wrap: normal;
+  text-decoration: none; border: 1px solid #333; padding: 1px 7px 2px; border-radius: 2px; line-height: 1.6;
+}
+.bd-refs a:hover { border-color: #777; color: var(--ink); }
+.bd-refs .ref-more { color: var(--grey); font-size: 12px; }
+.bd-meta { font-family: var(--sans); font-size: 13px; color: var(--grey); gap: 2px 18px; margin: 16px 0 0 !important; font-variant-numeric: tabular-nums; }
+.bd-meta .mono { font-family: var(--sans); font-size: 13px; color: var(--ink2); }
+.pub .bd-id { font-family: var(--mono); font-size: 11px; color: #5f5d59; }
+.bd-filters { font-family: var(--sans); font-size: 14px; gap: 16px; }
+.bd-filters .choice button { font-family: var(--sans); font-size: 14px; letter-spacing: .01em; }
+.bd-qsel { display: flex; align-items: baseline; gap: 12px; }
+.bd-qsel > span { color: var(--grey); font-size: 13px; text-transform: uppercase; letter-spacing: .09em; }
+.bd-qsel select {
+  font-family: var(--sans); font-size: 14px; color: var(--ink); background: transparent; border: none;
+  border-bottom: 1px solid #444; padding: 3px 18px 5px 0; max-width: 100%; cursor: pointer; -webkit-appearance: none; appearance: none;
+}
+.bd-qsel select option { background: #111; }
+.pub .bd-lean { font-size: 12.5px; line-height: 1.55; }
+.at-head h1 { font-weight: 500; }
+.at-lede { font-weight: 400; }
+
+/* home: live board strip */
+.now .col { max-width: 720px; }
+.now .now-lede { color: var(--ink2); font-style: italic; font-weight: 400; margin-top: -12px !important; }
+.now .bd-live { margin-top: 20px; border-top: 1px solid var(--hair); }
+.now .bd-live .bd-list > li:last-child { border-bottom: 1px solid var(--hair); }
+.now .now-more { margin-top: 22px !important; font-family: var(--sans); font-size: 14px; display: flex; gap: 22px; }
+.now .now-more a { color: var(--ink2); text-decoration-color: #444; }
+
+.bd-mark-note { font-family: var(--sans); text-transform: none; letter-spacing: .01em; font-size: 12px; color: var(--grey); font-weight: 400; }
+.bd-brief .bd-p { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.bd-qsel select { max-width: 560px; width: auto; }
+.bd-morelink { margin: 8px 0 0 !important; }
+.now .bd-brief .bd-p { -webkit-line-clamp: 2; }
+.now .bd-refs { display: none; }
+.now .bd-post { padding: 24px 0 20px; }
+.pub .bd-title { overflow-wrap: anywhere; }
+.bd-post, .bd-list, .bd-live, .now .col { min-width: 0; max-width: 100%; }
+.bd-refs a, .bd-refs .ref { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.bd-p { overflow-wrap: anywhere; }
+.bd-filters { min-width: 0; }
+.bd-filters .choice { display: flex; flex-wrap: wrap; max-width: 100%; min-width: 0; }
+.bd-filters { grid-template-columns: minmax(0, 1fr); }
+.bd-qsel { min-width: 0; }
+.bd-qsel select { max-width: 100%; min-width: 0; text-overflow: ellipsis; }
