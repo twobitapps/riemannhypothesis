@@ -118,7 +118,7 @@ function Feed({ now }) {
   const shownTopics = [...topics].sort((a, b) => (b.posts || 0) - (a.posts || 0)).slice(0, 14);
 
   return (
-    <section className="col bd-feed">
+    <section className="col bd-feed notes">
       <div className="bd-filters">
         <div className="choice" role="group" aria-label="Kind">
           <button type="button" className={!kind ? 'on' : ''} onClick={() => setKind('')}>all</button>
@@ -184,7 +184,7 @@ function Thread({ id, now }) {
   useEffect(() => { window.scrollTo({ top: 0 }); }, [id]);
 
   return (
-    <section className="col bd-thread">
+    <section className="col bd-thread notes">
       <p className="bd-back"><Link href="/board" scroll={false}>All posts</Link></p>
       {err && !t && <p className="err">{err}</p>}
       {!t && !err && <p className="at-quiet">Loading.</p>}
@@ -228,7 +228,8 @@ function Thread({ id, now }) {
 function Mark({ post }) {
   const l = labelOf(post);
   if (!l) return null;
-  return <span className="at-mark bd-mark" title={`${l.name}: ${l.note}`} aria-label={l.name}>{l.mark} <span className="bd-mark-note">{l.note}</span></span>;
+  const stamp = { kernel: 'Kernel checked', roundtrip: 'Round-trip', agreement: 'Two runs agree' }[l.key] || l.name;
+  return <span className={'at-mark bd-mark stamp stamp-' + l.key} title={`${l.name}: ${l.note}`} aria-label={l.name}><span className="stamp-mark">{l.mark}</span> <span className="bd-mark-note">{stamp}</span></span>;
 }
 
 function Post({ post, now, brief = false, reply = false }) {
@@ -239,10 +240,11 @@ function Post({ post, now, brief = false, reply = false }) {
   const ah = authorHref(post);
   const refs = (post.refs || []).map(parseRef);
   const compact = compactRefs(refs, brief ? 4 : 12);
-  const title = String(post.title || '').replace(/^card:\s*/i, '');
+  // Break long Lean names only at dots and underscores, never mid-word.
+  const title = String(post.title || '').replace(/^card:\s*/i, '').replace(/([._])(?=[A-Za-z])/g, '$1\u200B');
 
   return (
-    <article className={'bd-post' + (reply ? ' bd-reply' : '')} id={post.id}>
+    <article className={'bd-post' + (reply ? ' bd-reply' : '')} id={post.id} style={{ '--tilt': tiltOf(post.id) }}>
       <p className="bd-kind">
         {reply && post.stance && <span className={'bd-stance ' + post.stance}>{post.stance}</span>}
         <span>{post.kind}</span>
@@ -263,7 +265,7 @@ function Post({ post, now, brief = false, reply = false }) {
       {post.lean && <pre className="bd-lean mono">{post.lean}</pre>}
       {compact.shown.length > 0 && (
         <p className="bd-refs">
-          <span>Refs</span>
+          <span>cf.</span>
           {compact.shown.map((r, i) =>
             r.href ? (
               <Link key={r.id + i} href={r.href} scroll={false} title={r.full}>{r.label}</Link>
@@ -324,7 +326,7 @@ export function LiveBoard({ limit = 8 }) {
 
   if (!posts || posts.length === 0) return null;
   return (
-    <div className="bd-feed bd-live">
+    <div className="bd-feed bd-live notes">
       <ol className="bd-list">
         {posts.map((post) => (
           <li key={post.id}><Post post={post} now={now} brief /></li>
@@ -351,4 +353,12 @@ function compactRefs(refs, max) {
   }
   out.sort((a, b) => a.rank - b.rank);
   return { shown: out.slice(0, max), extra: Math.max(0, out.length - max) };
+}
+
+
+/* A note sits slightly askew on the desk; the same post always at the same angle. */
+function tiltOf(id) {
+  let h = 0;
+  for (const c of String(id || '')) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return `${(((h % 9) + 9) % 9 - 4) * 0.18}deg`;
 }

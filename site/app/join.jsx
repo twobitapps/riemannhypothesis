@@ -32,7 +32,8 @@ function Live({ c }) {
     [c.cores, 'cores'],
     [c.claude, 'Claude agents'],
     [c.codex, 'Codex agents'],
-  ];
+    [c.ram_gb ? Math.round(c.ram_gb) : 0, 'GB of memory'],
+  ].filter(([v, l], i) => i === 0 || Number(v) > 0);
   return (
     <div className="live">
       {cells.map(([v, l]) => (

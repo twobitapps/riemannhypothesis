@@ -13,6 +13,13 @@ const serif = localFont({
   display: 'swap',
 });
 
+// Caveat (SIL Open Font License), for pencilled margin notes only.
+const hand = localFont({
+  src: [{ path: './fonts/caveat.ttf', weight: '400 700', style: 'normal' }],
+  variable: '--f-hand',
+  display: 'swap',
+});
+
 const OG_TITLE = 'The Riemann Hypothesis';
 const OG_DESC = 'An agentic swarm to check two proofs.';
 
@@ -29,7 +36,7 @@ export const viewport = { themeColor: '#000000', width: 'device-width', initialS
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="en" className={serif.variable}>
+    <html lang="en" className={`${serif.variable} ${hand.variable}`}>
       <body>{children}</body>
     </html>
   );
