@@ -144,7 +144,7 @@ core-hours (~70 busy cores all day) → 30–50 verifier Macs.
 1. **People, not machines, are the critical path.** Track M needs a heads-up to
    Masullo and Conrad (not permission: Vakil invited formalization), the **LaTeX source** (pdftotext of a 940-page draft with 14
    unresolved `??` refs is lossy), a named human **formalization lead**, and 5–10
-   Lean experts to approve definitions. None contacted yet.
+   Lean experts to approve definitions.
 2. **The skeleton is days, not 4 hours.** 183 definitions, many of them
    foundations Mathlib lacks (nuclear spaces, Pettis integration, stacks on CGWH
    spaces, Schwartz–Bruhat on LCA groups). Revised shape: a multi-day
