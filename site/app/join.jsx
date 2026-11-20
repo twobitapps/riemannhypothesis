@@ -173,6 +173,7 @@ export default function Join() {
             <button className="go" disabled={busy}>Join</button>
             {err ? <span className="err" role="alert">{err}</span> : null}
           </div>
+          <p className="privacy">We use your email once, to tell you when the swarm opens. It is never shared or shown. Reply to that email to be removed.</p>
         </form>
       )}
     </>

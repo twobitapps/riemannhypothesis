@@ -12,10 +12,21 @@ const RH = (process.env.RH_API || '').replace(/\/+$/, '');
 const KEY = process.env.RH_PROXY_KEY || '';
 const DEV_FIXTURE = process.env.NODE_ENV === 'development' ? process.env.RH_FIXTURE : '';
 
-const GETS = new Set(['state', 'events', 'signups/count', 'join.sh', 'agent.md', 'llms.txt']);
-const POSTS = new Set(['hello', 'beat', 'lease', 'result', 'bye', 'signup']);
+const GETS = new Set(['state', 'events', 'signups/count', 'join.sh', 'agent.md', 'llms.txt',
+  'map', 'search', 'contributors', 'recall', 'board', 'board/digest', 'board/topics', 'receipts', 'index/modules', 'index/decls']);
+// Read routes with one path parameter: cards/<module>, source/<sha256>, board/post/<id>.
+const GET_PREFIX = [['cards/', /^[\p{L}\p{N}_'.!?«»₀-₉]{1,300}$/u], ['source/', /^[0-9a-f]{64}$/], ['board/post/', /^p\d{1,9}$/]];
+const POSTS = new Set(['hello', 'beat', 'lease', 'result', 'bye', 'signup', 'board', 'board/check']);
 const ONBOARDING = new Set(['join.sh', 'agent.md', 'llms.txt']); // served at the Worker root, not under /api
-const MAX_BODY = 64 * 1024;
+const MAX_BODY = 256 * 1024;
+// Short edge caching for the public atlas and board reads.
+const CACHE = { map: 'public, s-maxage=30', contributors: 'public, s-maxage=60', 'board/topics': 'public, s-maxage=30', search: 'public, s-maxage=300', 'index/modules': 'public, s-maxage=86400', 'index/decls': 'public, s-maxage=86400' };
+
+function allowedGet(key) {
+  if (GETS.has(key)) return true;
+  for (const [pre, re] of GET_PREFIX) if (key.startsWith(pre) && re.test(key.slice(pre.length))) return true;
+  return false;
+}
 
 const json = (body, status = 200, extra = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...extra } });
@@ -37,7 +48,7 @@ function upstreamHeaders(req, extra = {}) {
   return h;
 }
 
-const PASS = ['content-type', 'cache-control', 'retry-after'];
+const PASS = ['content-type', 'cache-control', 'retry-after', 'x-rh-parts'];
 function passResponse(r, cache) {
   const h = new Headers();
   for (const k of PASS) { const v = r.headers.get(k); if (v) h.set(k, v); }
@@ -72,9 +83,10 @@ async function fixtureGet(key) {
 export async function GET(req, { params }) {
   const key = (await params).path.join('/');
   if (DEV_FIXTURE) { const r = await fixtureGet(key); if (r) return r; }
-  if (!GETS.has(key)) return json({ error: 'not_found' }, 404);
+  if (!allowedGet(key)) return json({ error: 'not_found' }, 404);
   if (!RH) return json({ error: 'unconfigured' }, 503);
-  const target = ONBOARDING.has(key) ? `${RH}/${key}` : `${RH}/api/${key}${key === 'events' ? new URL(req.url).search : ''}`;
+  const path = key.startsWith('cards/') ? `cards/${encodeURIComponent(key.slice(6))}` : key;
+  const target = ONBOARDING.has(key) ? `${RH}/${key}` : `${RH}/api/${path}${new URL(req.url).search}`;
   try {
     if (key === 'events') {
       const r = await fetch(target, { cache: 'no-store', headers: upstreamHeaders(req, { accept: 'text/event-stream' }), signal: req.signal });
@@ -82,7 +94,8 @@ export async function GET(req, { params }) {
       return new Response(r.body, { status: r.status, headers: h });
     }
     const r = await fetch(target, { cache: 'no-store', headers: upstreamHeaders(req), signal: AbortSignal.timeout(10_000) });
-    return passResponse(r, key === 'signups/count' && r.ok ? 'public, s-maxage=5' : 'no-store');
+    const cache = !r.ok ? 'no-store' : key === 'signups/count' ? 'public, s-maxage=5' : key.startsWith('source/') ? 'public, max-age=31536000, immutable' : CACHE[key] || 'no-store';
+    return passResponse(r, cache);
   } catch {
     return json({ error: 'unreachable' }, 503);
   }

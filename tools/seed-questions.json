@@ -1,0 +1,54 @@
+{
+  "questions": [
+    {
+      "title": "Where does 'one more theta lift gives one more order of divisibility' live?",
+      "body": "The induction that each further theta lift buys one more order of divisibility is the step readers on the public Lean thread could not locate. Find the declarations that carry it (the ChainIntM chain and core_gm look like the place), state what they prove in plain mathematics, and say which hypotheses they consume.",
+      "refs": [
+        "Formalism.ThetaLiftIndependence.Statement",
+        "Development.AutomorphicArithmetic.PrimitiveCosets.CoreGm"
+      ],
+      "topic": "theta-divisibility"
+    },
+    {
+      "title": "Is the full local Langlands correspondence used, or only 'good' representations?",
+      "body": "Does the Lean development rely on the full local Langlands correspondence anywhere, or only on a restricted class of 'good' representations? Name the declarations where local Langlands enters and the exact class of representations they quantify over.",
+      "refs": [],
+      "topic": "local-langlands"
+    },
+    {
+      "title": "Is the AwayB weak local-global compatibility all that VWin uses?",
+      "body": "VWin appears to consume a weak local-global compatibility statement from the AwayB part. Check whether that weak form is the only input from AwayB that VWin needs, and whether anything stronger is assumed elsewhere along the way to Main.",
+      "refs": [
+        "Development.AutomorphicArithmetic.CharacterBoxes.ExistsPageN"
+      ],
+      "topic": "awayb-vwin"
+    },
+    {
+      "title": "Is the remark's sign-only Weil toy proof in the Lean?",
+      "body": "The accompanying remark sketches a toy argument in the style of Weil that only tracks signs. Is that argument formalized anywhere in the Lean, as a separate module or as a special case of the main line? If so, where; if not, which parts of the main proof replace it?",
+      "refs": [],
+      "topic": "weil-toy"
+    },
+    {
+      "title": "Which parts of the abelian-variety theory are load-bearing?",
+      "body": "A large share of the development builds theory of abelian varieties. Which of those declarations does the import cone of Main actually need for the final theorem, and which are present but not used by the proof of RH? A list of load-bearing statements, with the modules that use them, is the goal.",
+      "refs": [],
+      "topic": "abelian-varieties"
+    },
+    {
+      "title": "Can the proof be built and read in stages from ZeroFreeAllOfTopG?",
+      "body": "ZeroFreeAllOfTopG looks like a natural intermediate milestone. What does it state, which modules sit between it and Main, and can the development be checked and explained in stages starting from it?",
+      "refs": [
+        "Development.AutomorphicArithmetic.CharacterBoxes.ZeroFreeAllOfTopG",
+        "Main"
+      ],
+      "topic": "staged-build"
+    },
+    {
+      "title": "Map the remark's 20 timeline steps to Lean declarations",
+      "body": "The remark outlines the argument as a sequence of about twenty steps. For each step, find the Lean declaration (module and name) that formalizes it, so the English outline and the Lean can be read side by side. Post one finding per step or a table of several.",
+      "refs": [],
+      "topic": "timeline-map"
+    }
+  ]
+}
