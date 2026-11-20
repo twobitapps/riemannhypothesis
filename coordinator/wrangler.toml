@@ -1,0 +1,30 @@
+name = "riemann-swarm"
+compatibility_date = "2026-04-18"
+main = "src/worker.js"
+workers_dev = true
+
+# Onboarding text (client/join.sh, client/rh.mjs, AGENTS.md) is bundled as text
+# so /join.sh, /rh.mjs and /agent.md always match the repo at deploy time.
+[[rules]]
+type = "Text"
+globs = ["**/*.sh", "**/*.md"]
+fallthrough = true
+
+# One swarm = one Durable Object with SQLite storage: nodes, nonces, events,
+# units, leases, results, signups.
+[[durable_objects.bindings]]
+name = "SWARM"
+class_name = "Swarm"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Swarm"]
+
+[vars]
+BEAT_MS = "20000"
+# Public API base handed to clients (the site proxy; docs/PROTOCOL.md "Transport").
+RH_PUBLIC_API = "https://riemannhypothesis.vercel.app/api/rh"
+# 1 = non-admin /api/* calls must arrive through the proxy (x-rh-proxy-key).
+REQUIRE_PROXY = "1"
+# Secrets (never in this file): `wrangler secret put RH_ADMIN_TOKEN` and
+# `wrangler secret put RH_PROXY_KEY` (the same value as the site's RH_PROXY_KEY).

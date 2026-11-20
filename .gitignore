@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.vercel/
+.wrangler/
+coordinator/public/
+*.log
+.env*
+!.env.example
+.DS_Store
