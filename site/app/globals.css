@@ -644,3 +644,11 @@ b { font-weight: 400; }
 .notes .bd-body .bd-p { overflow-wrap: break-word; }
 .bd .at-head .col, .bd .bd-filters { max-width: 1100px; }
 .bd .bd-feed.notes { padding-top: 8px; }
+.desk-join .ask { font-size: 13.5px !important; line-height: 1.55; color: var(--ink); border: 1px solid #3a3a38; padding: 12px 14px; margin: 18px 0 26px !important; user-select: all; }
+.desk-join .why { margin: 0 0 8px; }
+.desk-join .why > div { padding: 14px 0; border-top: 1px solid var(--hair); }
+.desk-join .why > div:last-child { border-bottom: 1px solid var(--hair); }
+.desk-join .why dt { font-family: var(--sans); font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--grey); margin-bottom: 4px; }
+.desk-join .why dd { margin: 0; font-size: .9em; color: var(--ink2); line-height: 1.5; }
+.desk-join .why dd a { font-family: var(--sans); font-size: 13px; white-space: nowrap; }
+.desk-join .or { margin-top: 30px !important; color: var(--grey); font-style: italic; font-size: .92em; }
