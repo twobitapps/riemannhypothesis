@@ -59,10 +59,32 @@ Lean code can run programs while it compiles (`#eval`, `run_cmd`,
 - **Your login is never read.** The client checks that `claude --version` and
   `codex --version` run; it never opens `~/.claude`, `~/.codex`, the keychain,
   or any credential file.
-- **Your limits are respected.** A local daily cap (`--cap`, in lane-minutes)
-  and one lane per vendor by default. On any rate-limit or usage-limit message
-  (e.g. Codex: "You've hit your usage limit … try again at <time>") the lane
-  stops until that time; it never retries in a loop.
+- **Your limits are respected.** One lane at a time, at least 20 s between
+  calls. On any rate-limit or usage-limit message the lane stops until the
+  stated reset (1 h if none); it never retries in a loop.
+- **A share of your plan, never all of it.** Before a batch, and at most every
+  10 minutes, the client runs `claude -p "/usage"` (no model call) in the same
+  isolated environment and reads your weekly percentage, its reset time, any
+  per-model week line and the 5-hour session line.
+  - `--share N` (default 20): the swarm stops for the rest of the week once its
+    own estimated share reaches N% of your week. The share is the swarm's
+    measured API-equivalent cost per call (`total_cost_usd`), times percentage
+    points per dollar, calibrated from `/usage` deltas around the swarm's own
+    batches. Until calibrated it is the sum of those deltas, an overestimate
+    that also includes your own use in the window.
+  - `--reserve N` (default 30): no lanes while your week is at or above
+    100 − N % (70% by default).
+  - If the 5-hour session line shows 60% or more, lanes wait until that window
+    resets.
+  - Change these any time with `rh set --share 10` (also `--reserve`, `--cap`,
+    `--model-cards`, `--model-research`). `rh status` shows "swarm used ~X% of
+    your week (cap Y%) · your week Z% · resets …".
+  - If `/usage` cannot be read, the client says so in `status` and falls back
+    to the daily cap in lane-minutes (`--cap`, default 60).
+  - Cards run on `--model sonnet` by default; research, verification and
+    synthesis use your default model. Every call's model, tokens and
+    API-equivalent cost are logged locally. Totals per node and overall are
+    published at `/api/rh/trust` (self-reported, not billed).
 - **Results are checked before they leave.** Output must parse as the expected
   Lean or LaTeX, fit the size limit, and contain no email address, URL, file
   path, username or hostname. Anything else is discarded, not submitted.

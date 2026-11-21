@@ -6,6 +6,10 @@
 //                      [--github name]   optional public credit on the map and board
 //                      [--when idle|always]   lanes only when the machine is idle (default)
 //                      [--focus area]    module prefix or area this node prefers
+//                      [--share N]       % of your weekly plan the swarm may use (default 20)
+//                      [--reserve N]     never run while your week is ≥ 100−N % (default 30 → 70%)
+//                      [--model-cards m] [--model-research m]   default: sonnet for cards, your default for research
+//   node rh.mjs set    [--share N] [--reserve N] [--cap N] [--model-cards m] [--model-research m]
 //                      [--lean-project dir] [--archive lean.tar.gz] [--toolchain dir]
 //                                        Track R (verifier): see "Track R" below
 //   node rh.mjs run    [--mode research|cards|rebuild] [--cycles N] [--beats N]
@@ -276,6 +280,7 @@ function gate(st, noLane = false) {
   if (!noLane && st.limit_until && Date.now() < st.limit_until) return `model limit; resumes ${new Date(st.limit_until).toISOString()}`;
   const capMin = st.cap ?? DEFAULT_CAP_MIN;
   if (!noLane && usageToday(st) >= capMin * 60_000) return `daily cap reached (${capMin} lane-minutes)`;
+  if (!noLane) { const pg = planGate(st); if (pg) return pg; }
   if (onBattery()) return 'on battery';
   const free = diskFreeGb();
   const floor = Number(process.env.RH_MIN_FREE_GB || st.min_free_gb || MIN_FREE_GB);
@@ -325,18 +330,22 @@ function limitResetAt(text, now = Date.now()) {
 
 class LimitError extends Error {}
 
-async function runLane(prompt, meta) {
+async function runLane(prompt, meta, model = null) {
   ensureDirs();
-  const st = loadState();
+  await refreshPlan();
+  let st = loadState();
   const why = gate(st);
   if (why) throw new Error(`lane gated: ${why}`);
+  // Pacing: at least LANE_GAP_MS between lane calls.
+  const wait = (st.last_lane_end || 0) + LANE_GAP_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   if (Buffer.byteLength(prompt) > 600_000) throw new Error('prompt too large');
   const dir = fs.mkdtempSync(path.join(WORK_DIR, 'lane-'));
   const t0 = Date.now();
   let out = '', err = '', code = null, timedOut = false;
   try {
     await new Promise((resolve) => {
-      const p = spawn('claude', LANE_ARGS, { cwd: dir, env: laneEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+      const p = spawn('claude', model ? [...LANE_ARGS, '--model', model] : LANE_ARGS, { cwd: dir, env: laneEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
       const timer = setTimeout(() => { timedOut = true; p.kill('SIGTERM'); }, LANE_TIMEOUT_MS);
       p.stdout.on('data', (b) => { if (out.length < 4_000_000) out += b; });
       p.stderr.on('data', (b) => { if (err.length < 20_000) err += b; });
@@ -349,13 +358,22 @@ async function runLane(prompt, meta) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
   const ms = Date.now() - t0;
-  const s2 = loadState();
-  s2.usage = { [today()]: usageToday(s2) + ms };
-  saveState(s2);
   let res = null;
   try { res = JSON.parse(out); } catch { /* not JSON */ }
+  const cost = Number(res?.total_cost_usd) || 0;
+  const u = res?.usage || {};
+  const tokens = { input: u.input_tokens || 0, output: u.output_tokens || 0, cache_read: u.cache_read_input_tokens || 0, cache_write: u.cache_creation_input_tokens || 0 };
+  const s2 = loadState();
+  s2.usage = { [today()]: usageToday(s2) + ms };
+  s2.last_lane_end = Date.now();
+  s2.plan = { ...(s2.plan || {}), swarm_cost_week: ((s2.plan || {}).swarm_cost_week || 0) + cost };
+  const c = s2.counters || {};
+  s2.counters = { ...c, calls: (c.calls || 0) + 1, cost_usd: Math.round(((c.cost_usd || 0) + cost) * 1e4) / 1e4,
+    input_tokens: (c.input_tokens || 0) + tokens.input, output_tokens: (c.output_tokens || 0) + tokens.output,
+    cache_tokens: (c.cache_tokens || 0) + tokens.cache_read + tokens.cache_write, failed_calls: (c.failed_calls || 0) };
+  saveState(s2);
   const text = res?.result ?? '';
-  const model = res?.modelUsage ? Object.keys(res.modelUsage)[0] : null;
+  const modelUsed = res?.modelUsage ? Object.keys(res.modelUsage)[0] : null;
   const isErr = timedOut || code !== 0 || !res || res.is_error;
   const limitText = `${isErr ? text : ''}\n${err}\n${!res ? out.slice(0, 2000) : ''}`;
   if (isErr && LIMIT_RE.test(limitText)) {
@@ -365,11 +383,163 @@ async function runLane(prompt, meta) {
     throw new LimitError(`model limit reached; lanes pause until ${new Date(until).toISOString()}`);
   }
   if (isErr) {
+    const s4 = loadState(); s4.counters = { ...(s4.counters || {}), failed_calls: ((s4.counters || {}).failed_calls || 0) + 1 }; saveState(s4);
     logCall({ ...meta, ms, ok: false, reason: timedOut ? 'timeout' : `exit ${code}`, err: err.slice(0, 200) });
     throw new Error(timedOut ? 'lane timed out' : `lane failed (exit ${code})`);
   }
-  logCall({ ...meta, ms, ok: true, model, out_chars: text.length });
-  return { text, ms, model };
+  logCall({ ...meta, ms, ok: true, model: modelUsed, out_chars: text.length, cost_usd: cost, tokens });
+  return { text, ms, model: modelUsed, cost };
+}
+
+// ---------- the person's plan: share and reserve ----------
+//
+// `claude -p "/usage"` (no model call) reports the subscription's weekly use,
+// e.g. "Current week (all models): 92% used · resets Nov 25 at 6pm (America/Toronto)",
+// sometimes a per-model week line and a 5-hour session line. The swarm:
+//   - never runs lanes while the week is at or above 100 − reserve (default 70%);
+//   - stops when its own estimated share of the week reaches --share (default 20%);
+//   - pauses while the 5-hour session is at or above 60%, until it resets.
+// The swarm's share is estimated from its own measured cost per call
+// (total_cost_usd) times percentage points per dollar, calibrated from /usage
+// deltas around its own batches; before calibration it is the sum of those
+// deltas. Unparseable output falls back to the lane-minute cap (shown in status).
+
+const DEFAULT_SHARE = 20;
+const DEFAULT_RESERVE = 30;
+const SESSION_MAX = 60;
+const USAGE_EVERY_MS = 10 * 60_000;
+const LANE_GAP_MS = 20_000;
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+/** Epoch for wall-clock y-m-d h:min in an IANA zone (no dependencies). */
+function zonedEpoch(y, mo, d, h, mi, tz) {
+  const guess = Date.UTC(y, mo, d, h, mi);
+  try {
+    const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric' });
+    const p = Object.fromEntries(f.formatToParts(new Date(guess)).map((x) => [x.type, x.value]));
+    const asUtc = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour) % 24, Number(p.minute));
+    return guess - (asUtc - guess);
+  } catch { return guess; }
+}
+
+/** "Nov 25 at 6pm (America/Toronto)", "6pm (Europe/Paris)", "2:30am" → epoch ms, or null. */
+function parseReset(s, now = Date.now()) {
+  const m = String(s).match(/(?:([A-Za-z]{3})[a-z]*\s+(\d{1,2})\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i);
+  if (!m) return null;
+  let h = Number(m[3]) % 24; const mi = Number(m[4] || 0);
+  if (m[5]) { h = h % 12; if (/pm/i.test(m[5])) h += 12; }
+  const tz = m[6] || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const nowParts = new Date(now);
+  let y = nowParts.getUTCFullYear(), mo, d;
+  if (m[1] && MONTHS[m[1].toLowerCase()] != null) { mo = MONTHS[m[1].toLowerCase()]; d = Number(m[2]); }
+  else { mo = nowParts.getUTCMonth(); d = nowParts.getUTCDate(); }
+  let t = zonedEpoch(y, mo, d, h, mi, tz);
+  if (!m[1] && t <= now) t += 86_400_000;
+  if (m[1] && t < now - 86_400_000) t = zonedEpoch(y + 1, mo, d, h, mi, tz);
+  return t;
+}
+
+/** Parse /usage text defensively. */
+function parseUsage(text) {
+  const out = { week_pct: null, week_resets_at: null, session_pct: null, session_resets_at: null, models: {} };
+  for (const line of String(text).split('\n')) {
+    const m = line.match(/Current\s+(week|session)\s*(?:\(([^)]*)\))?\s*:\s*(\d{1,3})%\s*used(?:\s*[·•-]\s*resets\s+(.+))?/i);
+    if (!m) continue;
+    const pct = Number(m[3]);
+    const resets = m[4] ? parseReset(m[4]) : null;
+    if (/session/i.test(m[1])) { out.session_pct = pct; out.session_resets_at = resets; }
+    else if (!m[2] || /all models/i.test(m[2])) { out.week_pct = pct; out.week_resets_at = resets; }
+    else out.models[m[2].trim().toLowerCase()] = { pct, resets_at: resets };
+  }
+  return out;
+}
+
+/** Run /usage in the isolated lane environment; no model call, not counted as lane time. */
+async function probeUsage() {
+  const dir = fs.mkdtempSync(path.join(WORK_DIR, 'usage-'));
+  let out = '';
+  try {
+    await new Promise((resolve) => {
+      const p = spawn('claude', ['-p', '/usage', '--tools', '', '--strict-mcp-config', '--setting-sources', '', '--no-session-persistence'], { cwd: dir, env: laneEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+      const timer = setTimeout(() => p.kill('SIGTERM'), 60_000);
+      p.stdout.on('data', (b) => { if (out.length < 200_000) out += b; });
+      p.on('error', () => {});
+      p.on('close', () => { clearTimeout(timer); resolve(); });
+    });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  return parseUsage(out);
+}
+
+/** Refresh the plan view at most every 10 minutes; calibrate from the swarm's own batches. */
+async function refreshPlan(force = false) {
+  const st = loadState();
+  const plan = st.plan || {};
+  if (!force && plan.at && Date.now() - plan.at < USAGE_EVERY_MS) return plan;
+  const u = await probeUsage().catch(() => null);
+  const s = loadState();
+  const p = s.plan || {};
+  const now = Date.now();
+  if (!u || u.week_pct == null) {
+    s.plan = { ...p, at: now, ok: false };
+    saveState(s);
+    return s.plan;
+  }
+  // New week: start fresh.
+  if (!p.week_resets_at || (u.week_resets_at && Math.abs(u.week_resets_at - p.week_resets_at) > 3600_000) || (p.week_resets_at && now > p.week_resets_at)) {
+    p.week_start_pct = u.week_pct; p.swarm_cost_week = 0; p.swarm_pp_measured = 0; p.calib_pp = 0; p.calib_usd = 0;
+  }
+  // Calibration: usage delta across a window in which the swarm spent money.
+  const spent = (p.swarm_cost_week || 0) - (p.cost_at_probe || 0);
+  if (p.ok && p.week_pct != null && spent > 0) {
+    const d = Math.max(0, u.week_pct - p.week_pct);
+    p.swarm_pp_measured = (p.swarm_pp_measured || 0) + d; // upper bound: includes the person's own use
+    p.calib_pp = (p.calib_pp || 0) + d;
+    p.calib_usd = (p.calib_usd || 0) + spent;
+  }
+  Object.assign(p, { at: now, ok: true, week_pct: u.week_pct, week_resets_at: u.week_resets_at, session_pct: u.session_pct, session_resets_at: u.session_resets_at, models: u.models, cost_at_probe: p.swarm_cost_week || 0 });
+  s.plan = p;
+  saveState(s);
+  return p;
+}
+
+/** Estimated percentage points of the person's week the swarm has used. */
+function swarmShare(p) {
+  if (!p) return 0;
+  if (p.calib_usd > 0.5 && p.calib_pp > 0) return (p.swarm_cost_week || 0) * (p.calib_pp / p.calib_usd);
+  return p.swarm_pp_measured || 0;
+}
+
+function planGate(st) {
+  const p = st.plan;
+  if (!p || !p.ok) return null; // falls back to the lane-minute cap
+  const share = st.share ?? DEFAULT_SHARE, reserve = st.reserve ?? DEFAULT_RESERVE;
+  const until = p.week_resets_at ? ` until ${new Date(p.week_resets_at).toISOString()}` : '';
+  if (p.week_pct >= 100 - reserve) return `your week is at ${p.week_pct}% (the swarm stops at ${100 - reserve}%)${until}`;
+  const sw = swarmShare(p);
+  if (sw >= share) return `the swarm used ~${sw.toFixed(1)}% of your week (cap ${share}%)${until}`;
+  if (p.session_pct != null && p.session_pct >= SESSION_MAX && (!p.session_resets_at || Date.now() < p.session_resets_at)) {
+    return `your 5-hour session is at ${p.session_pct}%${p.session_resets_at ? ` until ${new Date(p.session_resets_at).toISOString()}` : ''}`;
+  }
+  return null;
+}
+
+function planLine(st) {
+  const p = st.plan;
+  if (!p || !p.ok) return 'plan usage not readable here: using the lane-minute cap only';
+  const reset = p.week_resets_at ? new Date(p.week_resets_at).toISOString().replace(':00.000Z', 'Z') : '?';
+  return `swarm used ~${swarmShare(p).toFixed(1)}% of your week (cap ${st.share ?? DEFAULT_SHARE}%) · your week ${p.week_pct}% (stop at ${100 - (st.reserve ?? DEFAULT_RESERVE)}%)${p.session_pct != null ? ` · session ${p.session_pct}%` : ''} · resets ${reset}`;
+}
+
+async function cmdSet(args) {
+  const s = loadState();
+  const num = (v, lo, hi, name) => { const n = Number(v); if (!(n >= lo && n <= hi)) die(`--${name} must be ${lo}–${hi}`); return n; };
+  if (args.share != null) s.share = num(args.share, 0, 100, 'share');
+  if (args.reserve != null) s.reserve = num(args.reserve, 0, 100, 'reserve');
+  if (args.cap != null) s.cap = num(args.cap, 0, 1440, 'cap');
+  if (typeof args['model-cards'] === 'string') s.model_cards = args['model-cards'] === 'default' ? null : args['model-cards'];
+  if (typeof args['model-research'] === 'string') s.model_research = args['model-research'] === 'default' ? null : args['model-research'];
+  saveState(s);
+  log(`share ${s.share ?? DEFAULT_SHARE}% · reserve ${s.reserve ?? DEFAULT_RESERVE}% · cap ${s.cap ?? DEFAULT_CAP_MIN} lane-min · cards ${s.model_cards === undefined ? 'sonnet' : s.model_cards || 'default'} · research ${s.model_research || 'default'}`);
 }
 
 // ---------- screening what leaves the machine ----------
@@ -495,7 +665,8 @@ async function doCardUnit(ctx) {
   ctx.activity = { track: 'A', unit_id: r.unit.id, lane: 'claude', phase: 'card', since: Date.now() };
   log(`card ${r.unit.id} (depth ${p.modules[0].depth}, ${p.modules.length} module${p.modules.length > 1 ? 's' : ''})`);
   let lane;
-  try { lane = await runLane(cardPrompt(p), { kind: 'card', unit: r.unit.id }); }
+  const st0 = loadState();
+  try { lane = await runLane(cardPrompt(p), { kind: 'card', unit: r.unit.id }, st0.model_cards === undefined ? 'sonnet' : st0.model_cards); }
   catch (e) {
     await signed(id, '/result', { lease_id: r.lease_id, unit_id: r.unit.id, verdict: 'skip' }).catch(() => {});
     throw e;
@@ -629,7 +800,7 @@ async function toolLoop(task, meta) {
   let transcript = `${task}\n\n${TOOL_SPEC}`;
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
     const last = turn === MAX_TURNS ? '\n\nThis is the last turn: reply with {"final": ...} now.' : '';
-    const { text, ms, model } = await runLane(transcript + last, { ...meta, turn });
+    const { text, ms, model } = await runLane(transcript + last, { ...meta, turn }, loadState().model_research || null);
     meta.ms = (meta.ms || 0) + ms; meta.model = model;
     const j = extractJson(text);
     if (!j) { transcript += `\n\n[assistant turn ${turn}]\n${text.slice(0, 2000)}\n\n[client] That was not JSON. Reply with JSON only.`; continue; }
@@ -713,7 +884,7 @@ async function plan(ctx, d) {
     '',
     'Reply with JSON only: {"action": "card"|"investigate"|"verify"|"synthesize", "target": "<post id, area or module prefix; omit for card>", "why": "<one sentence>"}',
   ].join('\n');
-  const { text, ms, model } = await runLane(prompt, { kind: 'plan' });
+  const { text, ms, model } = await runLane(prompt, { kind: 'plan' }, loadState().model_research || null);
   const j = extractJson(text);
   const action = ACTIONS.includes(j?.action) ? j.action : 'card';
   return { action, target: typeof j?.target === 'string' ? j.target.slice(0, 300) : null, why: typeof j?.why === 'string' ? j.why.slice(0, 300) : '', ms, model };
@@ -787,7 +958,7 @@ async function doSynthesize(ctx, target) {
     '',
     `Reply with JSON only: ${POST_SHAPE} with kind "synthesis"; refs = the post ids (p…) of the cards you combined (at least two) and their module names.`,
   ].join('\n');
-  const { text, ms } = await runLane(prompt, { kind: 'synthesize', target });
+  const { text, ms } = await runLane(prompt, { kind: 'synthesize', target }, loadState().model_research || null);
   const j = extractJson(text);
   const used = cards.map((c) => c.post).filter(Boolean);
   const refs = Array.isArray(j?.refs) ? j.refs.filter((r) => used.includes(r) || mods.includes(r)) : [];
@@ -1065,6 +1236,11 @@ async function cmdJoin(args) {
   const when = typeof args.when === 'string' ? args.when : prev.when || 'idle';
   if (!['idle', 'always'].includes(when)) die('--when must be idle or always');
   const focus = typeof args.focus === 'string' ? args.focus.slice(0, 200) : prev.focus || undefined;
+  for (const [k, lo, hi] of [['share', 0, 100], ['reserve', 0, 100]]) if (args[k] != null && !(Number(args[k]) >= lo && Number(args[k]) <= hi)) die(`--${k} must be ${lo}–${hi}`);
+  const share = args.share != null ? Number(args.share) : prev.share ?? DEFAULT_SHARE;
+  const reserve = args.reserve != null ? Number(args.reserve) : prev.reserve ?? DEFAULT_RESERVE;
+  const modelCards = typeof args['model-cards'] === 'string' ? args['model-cards'] : prev.model_cards;
+  const modelResearch = typeof args['model-research'] === 'string' ? args['model-research'] : prev.model_research;
   const rProject = typeof args['lean-project'] === 'string' ? path.resolve(args['lean-project']) : prev.r_project || null;
   const rArchive = typeof args.archive === 'string' ? path.resolve(args.archive) : prev.r_archive || null;
   const rToolchain = typeof args.toolchain === 'string' ? path.resolve(args.toolchain) : prev.r_toolchain || null;
@@ -1088,11 +1264,11 @@ async function cmdJoin(args) {
   fields.pow_nonce = prev.pow_nonce;
   const r = await signed(id, '/hello', fields, true);
   if (r.node_id !== id.nodeId) die(`coordinator returned node_id ${r.node_id}, expected ${id.nodeId}`);
-  saveState({ ...prev, pow_nonce: prev.pow_nonce, pow_key: prev.pow_key, coordinator: COORD, node_id: r.node_id, handle: r.handle ?? fields.handle, github: r.github ?? github ?? null, place: fields.place ?? null, roles: r.roles ?? roles, proofs: r.proofs ?? proofs, cap, when, focus: focus ?? null, r_project: rProject, r_archive: rArchive, r_toolchain: rToolchain, r_archive_sha256: R_ARCHIVE_SHA256, beat_ms: r.beat_ms, joined_at: prev.joined_at || Date.now() });
+  saveState({ ...prev, pow_nonce: prev.pow_nonce, pow_key: prev.pow_key, coordinator: COORD, node_id: r.node_id, handle: r.handle ?? fields.handle, github: r.github ?? github ?? null, place: fields.place ?? null, roles: r.roles ?? roles, proofs: r.proofs ?? proofs, cap, when, focus: focus ?? null, share, reserve, model_cards: modelCards, model_research: modelResearch, r_project: rProject, r_archive: rArchive, r_toolchain: rToolchain, r_archive_sha256: R_ARCHIVE_SHA256, beat_ms: r.beat_ms, joined_at: prev.joined_at || Date.now() });
   log(`joined ${COORD} as ${r.node_id} (${r.handle ?? fields.handle ?? 'generated handle'})`);
   log(`proofs: ${proofLabel(r.proofs ?? proofs)} (alpoge → tracks A+R, masullo → track M)`);
   log(`roles: ${(r.roles ?? roles).join(', ')} · suggested: ${(r.suggested_roles || []).join(', ')} · beat every ${r.beat_ms} ms`);
-  log(`lanes: daily cap ${cap ?? DEFAULT_CAP_MIN} lane-minutes (local) · run when ${when}${github ? ` · credit @${github}` : ''}`);
+  log(`lanes: at most ${share}% of your weekly plan, never while your week is ≥${100 - reserve}% · daily cap ${cap ?? DEFAULT_CAP_MIN} lane-minutes · run when ${when}${github ? ` · credit @${github}` : ''}`);
   log('next: node client/rh.mjs run');
   return r;
 }
@@ -1125,7 +1301,7 @@ async function cmdRun(args) {
 
   const beat = async () => {
     try {
-      await signed(id, '/beat', { status: ctx.status, activity: ctx.activity || undefined, load: { cpu: os.loadavg()[0] } });
+      await signed(id, '/beat', { status: ctx.status, activity: ctx.activity || undefined, load: { cpu: os.loadavg()[0] }, counters: loadState().counters || undefined });
       beats++;
     } catch (e) {
       log(`beat failed: ${e.message}`);
@@ -1187,7 +1363,10 @@ async function cmdStatus() {
   console.log(`coordinator ${COORD}`);
   console.log(`handle     ${st.handle ?? '-'}   place ${st.place ?? '-'}   roles ${(st.roles || []).join(', ') || '-'}   cap ${st.cap ?? '-'}`);
   console.log(`proofs     ${proofLabel(st.proofs || PROOFS)}${st.github ? `   github @${st.github}` : ''}   when ${st.when || 'idle'}`);
-  console.log(`lanes      today ${(usageToday(st) / 60_000).toFixed(1)} / ${st.cap ?? DEFAULT_CAP_MIN} lane-minutes · gate: ${gate(st) || 'open'}`);
+  if (probeLanes().claude) { ensureDirs(); await refreshPlan(true).catch(() => {}); }
+  const st2 = loadState();
+  console.log(`plan       ${planLine(st2)}`);
+  console.log(`lanes      today ${(usageToday(st2) / 60_000).toFixed(1)} / ${st2.cap ?? DEFAULT_CAP_MIN} lane-minutes · gate: ${gate(st2) || 'open'}`);
   try {
     const res = await fetch(`${COORD}/state`, { signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`state → ${res.status}${res.status === 403 ? ' (the live view opens at launch)' : ''}`);
@@ -1218,7 +1397,7 @@ const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0] || 'help';
 const major = Number(process.versions.node.split('.')[0]);
 if (major < 20) die(`Node ${process.versions.node} is too old; need 20+`);
-const cmds = { join: cmdJoin, run: cmdRun, status: cmdStatus, bye: cmdBye, leave: cmdLeave, pause: cmdPause, resume: cmdResume, 'lane-check': cmdLaneCheck, 'r-selftest': cmdRSelftest, 'link-github': cmdLinkGithub };
+const cmds = { join: cmdJoin, run: cmdRun, status: cmdStatus, bye: cmdBye, leave: cmdLeave, pause: cmdPause, resume: cmdResume, 'lane-check': cmdLaneCheck, 'r-selftest': cmdRSelftest, 'link-github': cmdLinkGithub, set: cmdSet };
 if (!cmds[cmd]) {
   console.log('usage: node rh.mjs join [--handle h] [--place p] [--roles thinker,verifier] [--cap N] [--proofs alpoge|masullo|both] [--github name] [--when idle|always] [--focus area] | run [--mode research|cards] [--cycles N] | pause | resume | status | lane-check | bye | leave --purge');
   process.exit(cmd === 'help' ? 0 : 2);

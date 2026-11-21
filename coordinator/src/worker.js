@@ -34,7 +34,7 @@ const NODES_LISTED_MS = 7 * 24 * 3600_000;
 // memory. Node rows are flushed at most once per node per FLUSH_MS (and on
 // hello/bye); leases, results, cards and posts are rows. See PROTOCOL.md.
 const FLUSH_MS = 10 * 60_000;
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 const ROLES = ['thinker', 'verifier', 'anchor', 'canary', 'finisher', 'prover', 'atlas'];
 const STATUSES = ['idle', 'preparing', 'thinking', 'checking', 'verifying', 'building', 'seeding', 'paused'];
@@ -310,6 +310,10 @@ export class Swarm {
       trust.initTrust(this.sql);
       this.reevaluate();
     }
+    if (v < 7) {
+      const nc = this.sql.exec('PRAGMA table_info(nodes)').toArray().map((c) => c.name);
+      if (!nc.includes('counters')) this.sql.exec('ALTER TABLE nodes ADD COLUMN counters TEXT');
+    }
     this.sql.exec("INSERT INTO schema_meta (k, v) VALUES ('version', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", String(SCHEMA_VERSION));
   }
 
@@ -548,12 +552,21 @@ export class Swarm {
       load = { cpu: num(body.load.cpu, 0, 1e4), mem_used_gb: num(body.load.mem_used_gb, 0, 65536) };
     }
     const prev = this.live.get(nodeId);
+    // Self-reported lane counters (calls, tokens, API-equivalent cost): published as totals, never trusted for anything else.
+    let counters = prev?.counters || null;
+    if (body.counters && typeof body.counters === 'object') {
+      counters = {};
+      for (const k of ['calls', 'failed_calls', 'cost_usd', 'input_tokens', 'output_tokens', 'cache_tokens', 'cycles', 'discarded']) {
+        const n = num(body.counters[k], 0, 1e12);
+        if (n != null) counters[k] = n;
+      }
+    }
     const wasLeft = prev ? !!prev.left : !!this.sql.exec('SELECT left_at FROM nodes WHERE node_id = ?', nodeId).one().left_at;
     const flush = wasLeft || !prev || now - prev.flushed_at >= FLUSH_MS;
-    this.live.set(nodeId, { status, activity, load, last_beat: now, flushed_at: flush ? now : prev.flushed_at, ip24: prev?.ip24 || trust.ip24(v.ip) });
+    this.live.set(nodeId, { status, activity, load, last_beat: now, flushed_at: flush ? now : prev.flushed_at, ip24: prev?.ip24 || trust.ip24(v.ip), counters });
     if (flush) {
-      this.sql.exec('UPDATE nodes SET status = ?, activity = ?, load = ?, last_beat = ?, left_at = NULL WHERE node_id = ?',
-        status, activity ? JSON.stringify(activity) : null, load ? JSON.stringify(load) : null, now, nodeId);
+      this.sql.exec('UPDATE nodes SET status = ?, activity = ?, load = ?, last_beat = ?, left_at = NULL, counters = ? WHERE node_id = ?',
+        status, activity ? JSON.stringify(activity) : null, load ? JSON.stringify(load) : null, now, counters ? JSON.stringify(counters) : null, nodeId);
     }
     if (wasLeft) {
       const row = this.sql.exec('SELECT * FROM nodes WHERE node_id = ?', nodeId).one();
@@ -691,6 +704,20 @@ export class Swarm {
     if (url && key && key.length >= 16) {
       this.bg(fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-rh-proxy-key': key }, body: JSON.stringify({ post }), signal: AbortSignal.timeout(15_000) }));
     }
+  }
+
+  /** Swarm-wide lane totals (self-reported by clients): calls, tokens, API-equivalent cost; per node and overall. */
+  laneTotals() {
+    const keys = ['calls', 'failed_calls', 'cost_usd', 'input_tokens', 'output_tokens', 'cache_tokens'];
+    const total = Object.fromEntries(keys.map((k) => [k, 0]));
+    const per = [];
+    for (const r of this.sql.exec('SELECT node_id, handle, github, counters FROM nodes WHERE counters IS NOT NULL').toArray()) {
+      const c = this.live.get(r.node_id)?.counters || parseJ(r.counters, {});
+      for (const k of keys) total[k] += Number(c[k]) || 0;
+      per.push({ handle: r.handle, github: r.github || null, ...Object.fromEntries(keys.map((k) => [k, Number(c[k]) || 0])) });
+    }
+    total.cost_usd = Math.round(total.cost_usd * 100) / 100;
+    return { note: 'self-reported by each client; cost is the API-equivalent price, billed to subscriptions, not paid', total, nodes: per.sort((a, b) => b.calls - a.calls).slice(0, 100) };
   }
 
   /** Recall hits agents may read: posts from new contributors wait for review. */
@@ -946,7 +973,7 @@ export class Swarm {
           const r = await recall.recall(this.env, this.sql, sp.get('q'), Math.min(20, Number(sp.get('k')) || 8));
           return pub({ ...r, hits: this.agentSafe(r.hits) });
         }
-        if (p === '/api/trust') return pub(this.cached('trust', 60_000, () => trust.trustView(this.sql)));
+        if (p === '/api/trust') return pub(this.cached('trust', 60_000, () => ({ ...trust.trustView(this.sql), lanes: this.laneTotals() })));
         if (p === '/api/board/topics') return pub({ topics: board.topics(this.sql) });
         if (p.startsWith('/api/board/post/')) {
           const t = board.thread(this.sql, p.slice('/api/board/post/'.length));

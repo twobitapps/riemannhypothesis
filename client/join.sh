@@ -12,6 +12,8 @@
 # --github  optional GitHub username, shown publicly as credit for accepted work
 # --when    idle (default: lanes run only when the machine is idle) or always
 # --focus   optional module prefix or area this node prefers on the board
+# --share   % of your weekly plan the swarm may use (default 20)
+# --reserve never run lanes while your week is >= 100-N % (default 30, i.e. 70%)
 #
 # What it does: checks Node 20+, finds or fetches the client, creates
 # ~/.riemann/identity.json (Ed25519, 0600), probes hardware, and sends one
@@ -31,11 +33,11 @@ REPO_DIR="${RH_REPO_DIR:-$RH_DIR/repo}"
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --handle|--place|--roles|--cap|--proofs|--github|--when|--focus)
+    --handle|--place|--roles|--cap|--proofs|--github|--when|--focus|--share|--reserve|--model-cards|--model-research)
       [ $# -ge 2 ] || { echo "join.sh: $1 needs a value" >&2; exit 2; }
       ARGS+=("$1" "$2"); shift 2 ;;
-    --handle=*|--place=*|--roles=*|--cap=*|--proofs=*|--github=*|--when=*|--focus=*) ARGS+=("$1"); shift ;;
-    -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || echo "see the header of join.sh"; exit 0 ;;
+    --handle=*|--place=*|--roles=*|--cap=*|--proofs=*|--github=*|--when=*|--focus=*|--share=*|--reserve=*|--model-cards=*|--model-research=*) ARGS+=("$1"); shift ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || echo "see the header of join.sh"; exit 0 ;;
     *) echo "join.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done

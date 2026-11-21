@@ -304,6 +304,16 @@ inputs. R2 storage is not enabled on the coordinator's account, so those
 bundles would be published as GitHub release assets of the public repository
 (≤2 GB each, accepted bundles only).
 
+### Lane counters and trust totals
+
+`POST beat` may carry `counters: { calls, failed_calls, cost_usd, input_tokens, output_tokens, cache_tokens }`,
+the client's cumulative lane totals (API-equivalent cost from `total_cost_usd`; billed to the
+person's subscription, never paid by anyone). They are self-reported, published only as totals,
+and never used for trust. `GET trust` → `{ tiers, results, audits, rules, lanes: { total, nodes } }`.
+
+`hello` (new keys) must carry `pow_nonce` (see SAFETY.md §6). `POST github/link` (signed)
+`{ login, gist_id }` → `{ ok, login, created_at, bonus }`.
+
 ### Vercel Board mirror (optional)
 
 With `RH_VERCEL_BOARD=1` on the site, each new post is mirrored to the team's

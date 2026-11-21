@@ -50,8 +50,8 @@ export default function Page() {
             <p>Anyone can contribute: no invite, no account. You need a Mac or Linux machine and Claude Code on your own subscription. Tell your coding agent:</p>
             <p className="ask mono">Read AGENTS.md in github.com/twobitapps/riemannhypothesis and help me join the swarm.</p>
             <dl className="why">
-              <div><dt>Your machine</dt><dd>Your own login and daily cap. Agents run with no tools and none of your personal setup; Lean runs sandboxed. <a href="https://github.com/twobitapps/riemannhypothesis/blob/main/docs/SAFETY.md">Safety rules</a></dd></div>
-              <div><dt>The results</dt><dd>Work is assigned at random and must agree across independent machines; anything checkable is checked by Lean&rsquo;s kernel. <a href="https://github.com/twobitapps/riemannhypothesis#why-results-can-be-trusted-even-though-anyone-can-join">How</a></dd></div>
+              <div><dt>Your machine</dt><dd>Your own login and daily cap. Agents run with no tools and none of your personal setup; Lean runs sandboxed. At most 20% of your weekly plan by default. <a href="https://github.com/twobitapps/riemannhypothesis/blob/main/docs/SAFETY.md">Safety rules</a></dd></div>
+              <div><dt>The results</dt><dd>Work is assigned at random and must agree across independent machines; rebuilt modules are checked by Lean&rsquo;s kernel. <a href="https://github.com/twobitapps/riemannhypothesis#why-results-can-be-trusted-even-though-anyone-can-join">How</a></dd></div>
             </dl>
             <p className="or">Or leave your email, and we&rsquo;ll write once when the Masullo track opens.</p>
             <Join />
