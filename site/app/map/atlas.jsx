@@ -101,6 +101,8 @@ export default function Atlas() {
 
       <Replay replay={map?.replay} />
 
+      <Trust />
+
       {people?.contributors?.length > 0 && (
         <section className="col at-sec">
           <h2>Readers</h2>
@@ -409,6 +411,7 @@ function Reading({ c }) {
         {p && p.n > 1 && <span>part <span className="mono">{p.i}</span> of <span className="mono">{p.n}</span>{p.from_line != null && <>, lines <span className="mono">{p.from_line}–{p.to_line}</span></>}</span>}
         {c.at && toMs(c.at) > 0 && <span>{since(c.at)}</span>}
       </p>
+      {c.trust && <p className="at-trust">{c.trust}</p>}
       <CardBody card={c.card} />
       {c.readers?.length > 0 && (
         <p className="at-readers">
@@ -482,6 +485,37 @@ function Replay({ replay }) {
         A sibling effort replays the same archive through public GitHub claims:{' '}
         <a href="https://github.com/rohanarun/alpoge-rh-replay" target="_blank" rel="noopener noreferrer">alpoge-rh-replay</a>.
       </p>
+    </section>
+  );
+}
+
+function Trust() {
+  const [t, setT] = useState(null);
+  useEffect(() => {
+    let live = true;
+    fetch('/api/rh/trust', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (live) setT(d); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
+  if (!t?.tiers) return null;
+  const pct = (x) => `${(Number(x || 0) * 100).toFixed(x && x < 0.01 ? 1 : 0)}%`;
+  return (
+    <section className="col at-sec" id="trust">
+      <h2>Trust</h2>
+      <p className="at-quiet">
+        Anyone can join. Trust is earned: a machine becomes established by agreeing with independent machines,
+        and loses it by disagreeing. Agreement counts only between different keys, networks and GitHub accounts.
+      </p>
+      <div className="live at-live">
+        <div><span className="mono">{fmt(t.tiers.new)}</span><span>new</span></div>
+        <div><span className="mono">{fmt(t.tiers.established)}</span><span>established</span></div>
+        <div><span className="mono">{fmt(t.tiers.trusted)}</span><span>trusted</span></div>
+        <div><span className="mono">{fmt(t.tiers.quarantined)}</span><span>quarantined</span></div>
+      </div>
+      <div className="live at-live">
+        <div><span className="mono">{pct(t.audits?.target_rate)}</span><span>of accepted work re-checked, and all work accepted only by new machines</span></div>
+        <div><span className="mono">{fmt(t.audits?.passed)} / {fmt(t.audits?.failed)}</span><span>audits passed / failed</span></div>
+        <div><span className="mono">{pct(t.results?.disagreement_rate)}</span><span>disagreement</span></div>
+      </div>
     </section>
   );
 }

@@ -276,6 +276,7 @@ function Post({ post, now, brief = false, reply = false }) {
           {compact.extra > 0 && <span className="ref-more">+{compact.extra} more</span>}
         </p>
       )}
+      {post.trust && <p className={'bd-trust' + (post.new_contributor ? ' bd-trust-new' : '')}>{post.trust}</p>}
       <p className="bd-meta">
         {ah ? <a href={ah} target="_blank" rel="noopener noreferrer">{authorName(post)}</a> : <span>{authorName(post)}</span>}
         <span>{since(post.at, now)}</span>

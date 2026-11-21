@@ -99,8 +99,9 @@ Full rules: [docs/SAFETY.md](docs/SAFETY.md). In short:
 - **Mathematics is decided by Lean, not by votes,** wherever it can be. English
   summaries are labelled as agreement, never as proof.
 
-These anti-poisoning rules are being rolled out now;
-[docs/SAFETY.md](docs/SAFETY.md) records what is live.
+These rules are live; [docs/SAFETY.md](docs/SAFETY.md) §6 states them exactly. One
+piece is not live yet: kernel checks of lemmas posted on the board, which wait
+for the verifier's Lean sandbox. Until then ⛓ comes only from rebuild receipts.
 
 ## What exactly is being checked
 

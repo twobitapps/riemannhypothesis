@@ -25,6 +25,7 @@
  *         email/URL/path screen.
  */
 import { screenText } from './atlas.js';
+import * as trust from './trust.js';
 
 export const POST_KINDS = ['question', 'finding', 'card', 'lemma', 'refutation', 'synthesis', 'stuck', 'plan', 'answer'];
 const STANCES = ['supports', 'disputes'];
@@ -81,6 +82,9 @@ export function initBoard(sql) {
   const cols = sql.exec('PRAGMA table_info(posts)').toArray().map((c) => c.name);
   if (!cols.includes('topic')) sql.exec('ALTER TABLE posts ADD COLUMN topic TEXT');
   if (!cols.includes('fixed_label')) sql.exec('ALTER TABLE posts ADD COLUMN fixed_label TEXT');
+  const ccols = sql.exec('PRAGMA table_info(post_checks)').toArray().map((c) => c.name);
+  if (!ccols.includes('ip24')) sql.exec('ALTER TABLE post_checks ADD COLUMN ip24 TEXT');
+  if (!ccols.includes('gh_login')) sql.exec('ALTER TABLE post_checks ADD COLUMN gh_login TEXT');
 }
 
 function clean(s, max) {
@@ -127,6 +131,11 @@ export function createPost(sw, v, { seed = false, derived = false, fixedLabel = 
   if (!seed && !derived) {
     const hour = sql.exec('SELECT COUNT(*) AS n FROM posts WHERE node_id = ? AND at > ?', nodeId, now - 3600_000).one().n;
     if (hour >= POSTS_PER_HOUR) return { error: 'rate_limited', status: 429 };
+    const tier = trust.tierOf(sql, nodeId);
+    if (tier === 'quarantined') return { error: 'quarantined', status: 403 };
+    if (tier === 'new' && sql.exec('SELECT COUNT(*) AS n FROM posts WHERE node_id = ? AND at > ?', nodeId, now - 86_400_000).one().n >= trust.NEW_POSTS_PER_DAY) {
+      return { error: 'rate_limited_new_node', status: 429 };
+    }
     if (!take(`n:${nodeId}`, BUCKETS.node, now)) return { error: 'rate_limited', status: 429 };
     if (v.ip && v.ip !== 'unknown' && !take(`i:${v.ip}`, BUCKETS.ip, now)) return { error: 'rate_limited', status: 429 };
   }
@@ -156,12 +165,14 @@ export function checkPost(sw, v) {
   if (!p) return { error: 'unknown_post', status: 404 };
   if (!p.lean) return { error: 'no_lean', status: 400 };
   if (p.node_id === nodeId) return { error: 'own_post', status: 403 };
+  const roles = JSON.parse(sql.exec('SELECT roles FROM nodes WHERE node_id = ?', nodeId).toArray()[0]?.roles || '[]');
+  if (!roles.includes('verifier')) return { error: 'verifier_role_required', status: 403 };
   const verdict = body.verdict === 'ok' || body.verdict === 'fail' ? body.verdict : null;
   if (!verdict) return { error: 'bad_verdict', status: 400 };
   if (body.sandboxed !== true || body.linted !== true) return { error: 'sandbox_and_lint_required', status: 400 };
-  sql.exec(`INSERT INTO post_checks (post_id, node_id, kind, verdict, detail, at) VALUES (?, ?, 'kernel', ?, ?, ?)
+  sql.exec(`INSERT INTO post_checks (post_id, node_id, kind, verdict, detail, at, ip24, gh_login) VALUES (?, ?, 'kernel', ?, ?, ?, ?, ?)
             ON CONFLICT(post_id, node_id, kind) DO UPDATE SET verdict = excluded.verdict, detail = excluded.detail, at = excluded.at`,
-    id, nodeId, verdict, clean(body.detail, 500), now);
+    id, nodeId, verdict, clean(body.detail, 500), now, v.ident?.ip24 || 'unknown', v.ident?.gh || null);
   const post = getPosts(sql, { ids: [id] })[0];
   sw.emit('post', { post, update: 'check' });
   return { ok: true, post };
@@ -172,30 +183,47 @@ export function checkPost(sw, v) {
 function decay(ageMs, halfLifeH) { return Math.pow(0.5, ageMs / (halfLifeH * 3600_000)); }
 
 function stats(sql, seqs, ids) {
-  // citations / supports / disputes from posts by other nodes; kernel checks
-  const out = Object.fromEntries(ids.map((id) => [id, { cites: 0, supports: 0, disputes: 0, kernel_ok: 0, kernel_fail: 0, replies: 0 }]));
+  // Citations, supports and disputes from other nodes, weighted by the citing
+  // node's tier (a ring of new nodes citing each other gains nothing), and
+  // kernel checks from independent verifiers.
+  const out = Object.fromEntries(ids.map((id) => [id, { cites: 0, supports: 0, disputes: 0, weight: 0, endorsed: false, kernel_ok: 0, kernel_fail: 0, kernel_strong: 0, replies: 0 }]));
   if (!ids.length) return out;
   const ph = ids.map(() => '?').join(',');
   const rows = sql.exec(
     `SELECT r.ref AS id, r.stance AS stance, p.node_id AS by, t.node_id AS author
      FROM post_refs r JOIN posts p ON p.seq = r.post_seq JOIN posts t ON t.id = r.ref
      WHERE r.is_post = 1 AND r.ref IN (${ph})`, ...ids).toArray();
+  const checks = sql.exec(`SELECT post_id, node_id, verdict, ip24, gh_login FROM post_checks WHERE kind = 'kernel' AND post_id IN (${ph})`, ...ids).toArray();
+  const tm = trust.tiers(sql, [...new Set([...rows.map((r) => r.by), ...checks.map((c) => c.node_id)])]);
+  const w = (id) => (id === 'coordinator' ? 2 : trust.TIER_WEIGHT[tm[id]] ?? 0);
   for (const r of rows) {
     const s = out[r.id];
     s.replies++;
-    if (r.by === r.author) continue;
+    if (r.by === r.author || tm[r.by] === 'quarantined') continue;
     s.cites++;
-    if (r.stance === 'supports') s.supports++;
-    if (r.stance === 'disputes') s.disputes++;
+    s.weight += w(r.by);
+    if (w(r.by) > 0) s.endorsed = true;
+    if (r.stance === 'supports' && w(r.by) > 0) s.supports++;
+    if (r.stance === 'disputes' && w(r.by) > 0) s.disputes++;
   }
-  for (const r of sql.exec(`SELECT post_id, verdict, COUNT(DISTINCT node_id) AS n FROM post_checks WHERE kind = 'kernel' AND post_id IN (${ph}) GROUP BY post_id, verdict`, ...ids).toArray()) {
-    if (r.verdict === 'ok') out[r.post_id].kernel_ok = r.n; else out[r.post_id].kernel_fail = r.n;
+  const okBy = {};
+  for (const c of checks) {
+    if (tm[c.node_id] === 'quarantined') continue;
+    if (c.verdict !== 'ok') { out[c.post_id].kernel_fail++; continue; }
+    (okBy[c.post_id] ||= []).push(c);
+  }
+  for (const [id, list] of Object.entries(okBy)) {
+    // count a largest pairwise-independent set of passing verifiers
+    const set = [];
+    for (const c of list) if (set.every((x) => trust.independent(trust.who(x), trust.who(c)))) set.push(c);
+    out[id].kernel_ok = set.length;
+    out[id].kernel_strong = set.filter((c) => w(c.node_id) > 0).length;
   }
   return out;
 }
 
 function labelOf(p, s) {
-  if (s.kernel_ok >= 2 && !s.kernel_fail) return 'kernel';
+  if (s.kernel_ok >= 2 && s.kernel_strong >= 1 && !s.kernel_fail) return 'kernel';
   if (p.kind === 'card' && p.agreed) return 'agreement';
   if (s.supports >= 1 && s.disputes === 0) return 'agreement';
   return null;
@@ -214,17 +242,30 @@ function shape(sql, rows, now = Date.now()) {
   const ids = rows.map((r) => r.id);
   const st = stats(sql, rows.map((r) => r.seq), ids);
   const who = authorMap(sql, rows.map((r) => r.node_id));
+  const authorTier = trust.tiers(sql, [...new Set(rows.map((r) => r.node_id))]);
   return rows.map((r) => {
     const s = st[r.id];
     const refs = parseJ(r.refs, []);
-    const agreed = r.kind === 'card' && refs.some((x) => !POST_ID.test(x) && sql.exec('SELECT 1 FROM cards WHERE module = ? LIMIT 1', x).toArray().length);
+    const cardRow = r.kind === 'card' ? refs.filter((x) => !POST_ID.test(x)).map((x) => sql.exec('SELECT nodes FROM cards WHERE module = ? LIMIT 1', x).toArray()[0]).find(Boolean) : null;
+    const agreed = !!cardRow;
     const label = r.fixed_label || labelOf({ kind: r.kind, agreed }, s);
-    const score = (1 + 2 * s.cites + 4 * s.supports + 6 * s.kernel_ok - 3 * s.disputes + (r.kind === 'question' && r.seed ? 2 : 0)) * decay(now - r.at, 24);
+    const tier = r.seed ? 'trusted' : String(r.node_id).startsWith('ext:') ? 'established' : authorTier[r.node_id] || 'new';
+    const newContributor = tier === 'new' && !r.seed && !r.fixed_label && !agreed;
+    let trustLine;
+    if (tier === 'quarantined') trustLine = 'author quarantined';
+    else if (label === 'kernel') trustLine = r.fixed_label ? 'rebuilt by independent nodes with identical outputs' : `kernel-checked by ${s.kernel_ok} independent verifiers (${s.kernel_strong} established)`;
+    else if (agreed) { const ns = parseJ(cardRow.nodes, []); trustLine = trust.trustLine({ nodes: ns, tierMap: trust.tiers(sql, ns) }); }
+    else if (s.supports) trustLine = `supported by ${s.supports} established node${s.supports > 1 ? 's' : ''}`;
+    else if (newContributor) trustLine = s.endorsed ? 'new contributor, cited by an established node' : 'new contributor, unreviewed';
+    else trustLine = r.seed ? 'seed question' : 'unchecked';
+    const score = (1 + 2 * s.weight + 4 * s.supports + 6 * s.kernel_ok - 3 * s.disputes + (r.kind === 'question' && r.seed ? 2 : 0)) * decay(now - r.at, 24);
     return {
       id: r.id, seq: r.seq, kind: r.kind, topic: r.topic || null, title: r.title, body: r.body, lean: r.lean || null, stance: r.stance || null,
       refs, node_id: r.node_id,
       author: r.seed ? { handle: 'coordinator', github: null } : String(r.node_id).startsWith('ext:') ? { handle: r.node_id.slice(4), github: null, via: 'vercel-board' } : who[r.node_id] || { handle: null, github: null },
       seed: !!r.seed, at: r.at, label, mark: label ? LABEL_MARK[label] : null,
+      tier, new_contributor: newContributor, trust: trustLine,
+      for_agents: tier !== 'quarantined' && (!newContributor || s.endorsed),
       cites: s.cites, replies: s.replies, supports: s.supports, disputes: s.disputes, kernel_ok: s.kernel_ok, kernel_fail: s.kernel_fail,
       score: Math.round(score * 1000) / 1000,
     };
@@ -284,9 +325,11 @@ export function digest(sql, focus) {
   const cardsQ = f
     ? sql.exec(`SELECT module, card FROM cards WHERE module = ? OR module LIKE ? ORDER BY at DESC LIMIT 12`, f, `${f}.%`).toArray()
     : sql.exec('SELECT module, card FROM cards ORDER BY at DESC LIMIT 12').toArray();
-  const brief = (p) => ({ id: p.id, kind: p.kind, label: p.label, by: p.author.github || p.author.handle, title: p.title, body: p.body.slice(0, 280), refs: p.refs.slice(0, 6), cites: p.cites, replies: p.replies });
+  const brief = (p) => ({ id: p.id, kind: p.kind, label: p.label, trust: p.trust, by: p.author.github || p.author.handle, title: p.title, body: p.body.slice(0, 280), refs: p.refs.slice(0, 6), cites: p.cites, replies: p.replies });
   const ids = new Set();
-  const uniq = (list) => list.filter((p) => (ids.has(p.id) ? false : (ids.add(p.id), true)));
+  // Agents only see posts from established or trusted authors, or posts an
+  // established node has cited; new contributors' posts wait for review.
+  const uniq = (list) => list.filter((p) => p.for_agents && (ids.has(p.id) ? false : (ids.add(p.id), true)));
   return {
     focus: f,
     open_questions: uniq(questions).map(brief),

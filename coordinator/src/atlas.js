@@ -16,6 +16,8 @@
  * project imports (summary + role only).
  */
 
+import * as trust from './trust.js';
+
 export const CARD_LIMITS = {
   summary_words: 120, summary_chars: 1200,
   role_words: 40, role_chars: 400,
@@ -189,21 +191,42 @@ function importsReady(sql, imports) {
   return true;
 }
 
-/** Pick the shallowest open card unit this node may take. Returns {unit, payload} or null. */
-export async function pickCardUnit(sql, nodeId, now) {
-  const rows = sql.exec(
-    `SELECT u.* FROM units u WHERE u.track = 'A' AND u.kind = 'card' AND u.state = 'open'
-       AND (SELECT COUNT(*) FROM leases l WHERE l.unit_id = u.id AND l.closed_at IS NULL AND l.expires_at >= ?) < ?
-       AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.unit_id = u.id AND l.node_id = ?)
-     ORDER BY u.depth ASC, u.id ASC LIMIT 20`,
-    now, LEASES_PER_CARD_UNIT, nodeId,
-  ).toArray();
-  for (const u of rows) {
-    const p = parseJ(u.payload, null);
-    if (!p) continue;
-    if (!importsReady(sql, p.imports || [])) continue;
-    const payload = await buildPayload(sql, u, p);
-    if (payload) return { unit: u, payload };
+/**
+ * Pick a card unit for this node. The coordinator chooses, at random: audit
+ * units first for established and trusted nodes, otherwise a random open unit
+ * at the shallowest depth that has one this node may take. Returns {unit, payload} or null.
+ */
+export async function pickCardUnit(sql, nodeId, now, tier = 'new') {
+  const ok = (u) => {
+    const active = sql.exec('SELECT COUNT(*) AS n FROM leases WHERE unit_id = ? AND closed_at IS NULL AND expires_at >= ?', u.id, now).one().n;
+    if (active >= LEASES_PER_CARD_UNIT) return false;
+    return !sql.exec('SELECT 1 FROM leases WHERE unit_id = ? AND node_id = ? LIMIT 1', u.id, nodeId).toArray().length;
+  };
+  const tryRows = async (rows, audit) => {
+    for (const u of rows) {
+      if (!ok(u)) continue;
+      const p = parseJ(u.payload, null);
+      if (!p || (!audit && !importsReady(sql, p.imports || []))) continue;
+      const payload = await buildPayload(sql, u, p);
+      if (payload) return { unit: u, payload: { ...payload, audit: !!audit } };
+    }
+    return null;
+  };
+  if (tier === 'established' || tier === 'trusted') {
+    const audits = sql.exec("SELECT * FROM units WHERE audit = 1 AND track = 'A' AND kind = 'card' LIMIT 20").toArray()
+      .sort(() => Math.random() - 0.5);
+    const r = await tryRows(audits, true);
+    if (r) return r;
+  }
+  let depth = -1e9;
+  for (let step = 0; step < 4; step++) {
+    const d = sql.exec("SELECT depth FROM units WHERE track = 'A' AND state = 'open' AND depth > ? ORDER BY depth LIMIT 1", depth).toArray()[0];
+    if (!d) return null;
+    depth = d.depth;
+    const x = Math.random();
+    const q = (cmp) => sql.exec(`SELECT * FROM units WHERE track = 'A' AND state = 'open' AND depth = ? AND rk ${cmp} ? AND kind = 'card' ORDER BY rk LIMIT 20`, depth, x).toArray();
+    const r = (await tryRows(q('>='), false)) || (await tryRows(q('<'), false));
+    if (r) return r;
   }
   return null;
 }
@@ -235,7 +258,11 @@ const URLISH = /\b(?:https?|ftp|file|ssh):\/\/|\bwww\.[a-z0-9-]+\./i;
 const PATHISH = /(?:^|[\s"'`(])(?:~\/[\w.-]+\/|\/(?:Users|home|private|tmp|var|etc|opt|root|Volumes)\/[\w.-])|\b[A-Z]:\\(?:Users|Windows|Program|Documents)/;
 const HOSTISH = /\b[a-z0-9-]+\.(?:local|lan|internal|home|corp)\b/i;
 
+// Text that addresses other agents with instructions (prompt injection).
+const INSTRUCT = /\b(?:ignore|disregard|forget|override)\b[^.\n]{0,40}\b(?:previous|prior|above|earlier|all|your)\b[^.\n]{0,20}\b(?:instructions?|prompts?|rules|guidelines)\b|\byou must\b|\bnew instructions\b|\bsystem prompt\b|\bas an ai\b|<\/?\s*(?:system|untrusted|instructions?)\b|\b(?:agents?|assistants?|models?|lanes?)\s*[,:]\s*(?:please\s+)?(?:do|run|post|execute|reply|ignore|always|never)\b/i;
+
 export function screenText(s) {
+  if (INSTRUCT.test(s)) return 'instructions';
   if (EMAIL.test(s)) return 'email';
   if (URLISH.test(s)) return 'url';
   if (PATHISH.test(s)) return 'path';
@@ -280,7 +307,7 @@ function cleanCard(c, mod, decls, expect) {
  * parsed from the source; on the second valid run from a different node that
  * names the same declarations, the cards are accepted.
  */
-export function cardResult(sw, { lease, unit, nodeId, body, now }) {
+export function cardResult(sw, { lease, unit, nodeId, body, now, ident }) {
   const sql = sw.sql;
   const p = parseJ(unit.payload, null);
   const submitted = Array.isArray(body.cards) ? body.cards : [];
@@ -302,19 +329,58 @@ export function cardResult(sw, { lease, unit, nodeId, body, now }) {
   const vendor = typeof body.vendor === 'string' ? body.vendor.slice(0, 16) : null;
   const model = typeof body.model === 'string' ? body.model.slice(0, 64) : null;
   const laneMs = Number.isFinite(Number(body.lane_ms)) ? Math.max(0, Math.min(3600_000, Math.round(Number(body.lane_ms)))) : null;
-  sql.exec(`INSERT INTO card_runs (unit_id, node_id, lease_id, at, status, reason, names, cards, vendor, model, lane_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    unit.id, nodeId, lease.lease_id, now, status, reason, JSON.stringify(names), status === 'valid' ? JSON.stringify(cards) : null, vendor, model, laneMs);
+  sql.exec(`INSERT INTO card_runs (unit_id, node_id, lease_id, at, status, reason, names, cards, vendor, model, lane_ms, ip24, gh_login) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    unit.id, nodeId, lease.lease_id, now, status, reason, JSON.stringify(names), status === 'valid' ? JSON.stringify(cards) : null, vendor, model, laneMs, ident?.ip24 || 'unknown', ident?.gh || null);
 
-  let accepted = false, disagreed = false;
+  let accepted = false, disagreed = false, audit = null;
+  if (status === 'valid' && unit.state === 'done' && unit.audit) {
+    // Spot audit by an established or trusted node.
+    const agreed = sql.exec("SELECT * FROM card_runs WHERE unit_id = ? AND status = 'agreed'", unit.id).toArray();
+    const key = JSON.stringify(names);
+    const tier = trust.tierOf(sql, nodeId);
+    if (agreed.length && (tier === 'established' || tier === 'trusted')) {
+      if (agreed[0].names === key) {
+        sql.exec('UPDATE units SET audit = 0, updated_at = ? WHERE id = ?', now, unit.id);
+        sql.exec("UPDATE audits SET verdict = 'passed', auditor = ?, done_at = ? WHERE unit_id = ? AND verdict IS NULL", nodeId, now, unit.id);
+        sql.exec("UPDATE card_runs SET status = 'audit' WHERE unit_id = ? AND node_id = ? AND status = 'valid'", unit.id, nodeId);
+        trust.recordOutcomes(sql, [nodeId, ...agreed.map((r) => r.node_id)], []);
+        audit = 'passed';
+      } else {
+        sql.exec("UPDATE audits SET verdict = 'failed', auditor = ?, done_at = ? WHERE unit_id = ? AND verdict IS NULL", nodeId, now, unit.id);
+        reopenUnit(sw, unit.id, now, 'audit');
+        const q = trust.recordOutcomes(sql, [], agreed.map((r) => r.node_id));
+        for (const id of q) requeueNode(sw, id, now);
+        audit = 'failed';
+      }
+    }
+    const verdict = audit === 'passed' ? 'ok' : audit === 'failed' ? 'fail' : 'pending';
+    return { verdict, status, reason, accepted: false, audit };
+  }
   if (status === 'valid') {
     const runs = sql.exec("SELECT * FROM card_runs WHERE unit_id = ? AND status = 'valid' ORDER BY id ASC", unit.id).toArray();
-    const mine = runs[runs.length - 1];
+    const tierMap = trust.tiers(sql, [...new Set(runs.map((r) => r.node_id))]);
+    const live = runs.filter((r) => tierMap[r.node_id] !== 'quarantined');
+    const mine = live.find((r) => r.lease_id === lease.lease_id);
     const key = JSON.stringify(names);
-    const partner = runs.slice(0, -1).find((r) => r.node_id !== nodeId && r.names === key);
-    if (partner) {
+    // Largest set of pairwise-independent runs with my answer, starting from mine.
+    const group = mine ? [mine] : [];
+    for (const r of live) {
+      if (r === mine || r.names !== key) continue;
+      if (group.every((g) => trust.independent(trust.who(g), trust.who(r)))) group.push(r);
+    }
+    const est = group.filter((r) => tierMap[r.node_id] === 'established' || tierMap[r.node_id] === 'trusted').length;
+    if (mine && ((group.length >= 2 && est >= 1) || group.length >= 3)) {
       accepted = true;
-      acceptCards(sw, unit, p, partner, mine, now);
-    } else if (runs.some((r) => r.node_id !== nodeId && r !== mine)) {
+      acceptCards(sw, unit, p, group, now);
+      const wrong = live.filter((r) => r.names !== key && group.some((g) => trust.independent(trust.who(g), trust.who(r))));
+      const q = trust.recordOutcomes(sql, group.map((r) => r.node_id), wrong.map((r) => r.node_id));
+      for (const id of q) requeueNode(sw, id, now);
+      const allNew = est === 0;
+      if (allNew || Math.random() < trust.AUDIT_RATE) {
+        sql.exec('UPDATE units SET audit = 1 WHERE id = ?', unit.id);
+        sql.exec('INSERT INTO audits (unit_id, reason, at) VALUES (?, ?, ?)', unit.id, allNew ? 'accepted by new nodes only' : 'random 5%', now);
+      }
+    } else if (live.some((r) => r.names !== key && r !== mine)) {
       disagreed = true;
     }
   }
@@ -323,12 +389,14 @@ export function cardResult(sw, { lease, unit, nodeId, body, now }) {
       MAX_CARD_ATTEMPTS, now, unit.id);
   }
   const verdict = accepted ? 'ok' : status === 'invalid' ? 'fail' : disagreed ? 'fail' : 'pending';
-  return { verdict, status, reason, accepted, disagreed, runs_needed: accepted ? 0 : RUNS_TO_ACCEPT - 1 };
+  return { verdict, status, reason, accepted, disagreed, needs: accepted ? null : 'independent agreement: 2 runs with an established node, or 3 new nodes' };
 }
 
-function acceptCards(sw, unit, p, first, second, now) {
+function acceptCards(sw, unit, p, group, now) {
   const sql = sw.sql;
+  const first = group[0], second = group[1];
   const a = parseJ(first.cards, []), b = parseJ(second.cards, []);
+  const ids = group.map((r) => r.node_id);
   for (const c of a) {
     const row = moduleRow(sql, c.module);
     const other = b.find((x) => x.module === c.module) || null;
@@ -336,11 +404,27 @@ function acceptCards(sw, unit, p, first, second, now) {
     sql.exec(`INSERT INTO cards (key, module, unit_id, depth, area, part, card, second, nodes, label, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'agreement', ?)
               ON CONFLICT(key) DO UPDATE SET card = excluded.card, second = excluded.second, nodes = excluded.nodes, at = excluded.at`,
       key, c.module, unit.id, row?.depth ?? unit.depth, row?.area ?? unit.area, p.part ? JSON.stringify(p.part) : null,
-      JSON.stringify(c), JSON.stringify(other), JSON.stringify([first.node_id, second.node_id]), now);
+      JSON.stringify(c), JSON.stringify(other), JSON.stringify(ids), now);
   }
   sql.exec("UPDATE units SET state = 'done', updated_at = ? WHERE id = ?", now, unit.id);
-  sql.exec("UPDATE card_runs SET status = 'agreed' WHERE id IN (?, ?)", first.id, second.id);
-  sw.emit('card', { unit_id: unit.id, modules: a.map((c) => c.module), nodes: [first.node_id, second.node_id], label: 'agreement' });
+  for (const r of group) sql.exec("UPDATE card_runs SET status = 'agreed' WHERE id = ?", r.id);
+  sw.emit('card', { unit_id: unit.id, modules: a.map((c) => c.module), nodes: ids, label: 'agreement' });
+}
+
+/** Undo an acceptance: cards removed, unit open again, its agreeing runs set aside. */
+export function reopenUnit(sw, unitId, now, why) {
+  const sql = sw.sql;
+  sql.exec('DELETE FROM cards WHERE unit_id = ?', unitId);
+  sql.exec("UPDATE units SET state = 'open', audit = 0, updated_at = ? WHERE id = ?", now, unitId);
+  sql.exec(`UPDATE card_runs SET status = ? WHERE unit_id = ? AND status = 'agreed'`, why === 'audit' ? 'disputed' : 'valid', unitId);
+  sw.emit('card', { unit_id: unitId, reopened: true, why });
+}
+
+/** A quarantined node's accepted work goes back in the queue. */
+export function requeueNode(sw, nodeId, now) {
+  const units = sw.sql.exec("SELECT DISTINCT unit_id FROM card_runs WHERE node_id = ? AND status = 'agreed'", nodeId).toArray();
+  for (const u of units) reopenUnit(sw, u.unit_id, now, 'quarantine');
+  sw.sql.exec("UPDATE card_runs SET status = 'quarantined' WHERE node_id = ? AND status IN ('valid', 'agreed')", nodeId);
 }
 
 // ---------- public reads ----------
@@ -390,7 +474,7 @@ export function moduleView(sql, name) {
   const cards = sql.exec('SELECT * FROM cards WHERE module = ? ORDER BY key', name).toArray();
   const ids = [...new Set(cards.flatMap((c) => parseJ(c.nodes, [])))];
   const who = handles(sql, ids);
-  const unit = sql.exec(`SELECT u.id, u.state, u.attempts FROM unit_modules m JOIN units u ON u.id = m.unit_id WHERE m.module = ? ORDER BY u.id LIMIT 1`, name).toArray()[0] || null;
+  const unit = sql.exec(`SELECT u.id, u.state, u.attempts, u.audit FROM unit_modules m JOIN units u ON u.id = m.unit_id WHERE m.module = ? ORDER BY u.id LIMIT 1`, name).toArray()[0] || null;
   let runs = 0;
   if (unit) runs = sql.exec("SELECT COUNT(*) AS n FROM card_runs WHERE unit_id = ? AND status IN ('valid','agreed')", unit.id).one().n;
   const decls = parseJ(row.decls, []);
@@ -404,6 +488,7 @@ export function moduleView(sql, name) {
     unit: unit ? { id: unit.id, state: unit.state, attempts: unit.attempts, valid_runs: runs } : null,
     cards: cards.map((c) => ({
       key: c.key, label: c.label, part: parseJ(c.part, null), at: c.at,
+      trust: trust.trustLine({ nodes: parseJ(c.nodes, []), tierMap: trust.tiers(sql, parseJ(c.nodes, [])), audit: unit?.audit ? 'pending' : null }),
       card: parseJ(c.card, null), second: parseJ(c.second, null),
       readers: parseJ(c.nodes, []).map((id) => who[id] || { handle: null, github: null }),
     })),

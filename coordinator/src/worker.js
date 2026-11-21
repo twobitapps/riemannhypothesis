@@ -17,6 +17,7 @@ import * as recall from './recall.js';
 import * as replay from './replay.js';
 import { handleSignups } from './signups.js';
 import { searchModules } from './search.js';
+import * as trust from './trust.js';
 
 const DEFAULT_BEAT_MS = 20_000;
 const TS_WINDOW_MS = 5 * 60_000;
@@ -33,7 +34,7 @@ const NODES_LISTED_MS = 7 * 24 * 3600_000;
 // memory. Node rows are flushed at most once per node per FLUSH_MS (and on
 // hello/bye); leases, results, cards and posts are rows. See PROTOCOL.md.
 const FLUSH_MS = 10 * 60_000;
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const ROLES = ['thinker', 'verifier', 'anchor', 'canary', 'finisher', 'prover', 'atlas'];
 const STATUSES = ['idle', 'preparing', 'thinking', 'checking', 'verifying', 'building', 'seeding', 'paused'];
@@ -305,6 +306,10 @@ export class Swarm {
     replay.initReplay(this.sql);
     this.sql.exec('CREATE TABLE IF NOT EXISTS blobs (name TEXT, part INTEGER, parts INTEGER, data BLOB, PRIMARY KEY (name, part))');
     this.sql.exec('CREATE INDEX IF NOT EXISTS leases_open ON leases (closed_at, expires_at)');
+    if (v < 6) {
+      trust.initTrust(this.sql);
+      this.reevaluate();
+    }
     this.sql.exec("INSERT INTO schema_meta (k, v) VALUES ('version', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", String(SCHEMA_VERSION));
   }
 
@@ -463,7 +468,30 @@ export class Swarm {
     return { body, nodeId, pubB64, now, raw: new TextDecoder().decode(bytes), sig: sigB64, ip: req.headers.get('x-rh-ip') || null };
   }
 
-  hello(v) {
+  /**
+   * Once, when the independence rules arrived: acceptances whose nodes were
+   * not independent (runs recorded before client networks were) go back to
+   * pending, and their board labels are cleared.
+   */
+  reevaluate() {
+    const now = Date.now();
+    for (const u of this.sql.exec("SELECT DISTINCT unit_id FROM card_runs WHERE status = 'agreed' AND (ip24 IS NULL OR ip24 = 'unknown')").toArray()) {
+      atlas.reopenUnit(this, u.unit_id, now, 'reevaluate');
+    }
+    for (const u of this.sql.exec("SELECT DISTINCT unit_id FROM receipts WHERE status = 'agreed' AND (ip24 IS NULL OR ip24 = 'unknown')").toArray()) {
+      this.sql.exec("UPDATE receipts SET status = 'pending' WHERE unit_id = ? AND status = 'agreed'", u.unit_id);
+      this.sql.exec("UPDATE units SET state = 'open', updated_at = ? WHERE id = ?", now, u.unit_id);
+    }
+    this.sql.exec("UPDATE posts SET fixed_label = NULL WHERE fixed_label = 'kernel' AND refs LIKE '%R:pk:%'");
+  }
+
+  /** Who did this work: client network and GitHub account, for independence checks. */
+  ident(v) {
+    const n = this.sql.exec('SELECT gh_login, gh_created_at FROM nodes WHERE node_id = ?', v.nodeId).toArray()[0];
+    return { ip24: trust.ip24(v.ip), gh: n?.gh_login || null };
+  }
+
+  async hello(v) {
     const { body, nodeId, pubB64, now } = v;
     const machine = cleanMachine(body.machine);
     const lanes = cleanLanes(body.lanes);
@@ -473,6 +501,18 @@ export class Swarm {
     const c = body.client && typeof body.client === 'object' ? body.client : {};
     const client = { name: str(c.name, 32), version: str(c.version, 16), platform: str(c.platform, 16) };
     const prev = this.sql.exec('SELECT handle, joined_at FROM nodes WHERE node_id = ?', nodeId).toArray()[0];
+    const net = trust.ip24(v.ip);
+    if (!prev) {
+      // Permissionless, with a cost: proof of work once per key, and per-network caps.
+      if (!(await trust.powOk(pubB64, body.pow_nonce))) return json({ error: 'pow_required', bits: trust.POW_BITS }, 400);
+      const day = Math.floor(now / 86_400_000);
+      const made = this.sql.exec('SELECT n FROM ip_new WHERE ip24 = ? AND day = ?', net, day).toArray()[0]?.n ?? 0;
+      if (made >= trust.NEW_PER_IP_DAY) return json({ error: 'too_many_new_nodes_from_network', max: trust.NEW_PER_IP_DAY }, 429);
+      this.sql.exec('INSERT INTO ip_new (ip24, day, n) VALUES (?, ?, 1) ON CONFLICT(ip24, day) DO UPDATE SET n = n + 1', net, day);
+    }
+    let activeHere = 0;
+    for (const [id, l] of this.live) if (id !== nodeId && !l.left && l.ip24 === net && now - l.last_beat <= 3 * this.beatMs) activeHere++;
+    if (activeHere >= trust.ACTIVE_PER_IP) return json({ error: 'too_many_active_nodes_from_network', max: trust.ACTIVE_PER_IP }, 429);
     const handle = str(body.handle, 24, /[^A-Za-z0-9 _.\-]/g) || prev?.handle || genHandle(nodeId);
     const place = str(body.place, 40, /[^\p{L}\p{N} ,.'\-]/gu);
     let github = null;
@@ -491,9 +531,9 @@ export class Swarm {
          last_beat = excluded.last_beat, left_at = NULL`,
       nodeId, pubB64, handle, place, JSON.stringify(machine), JSON.stringify(lanes), JSON.stringify(finalRoles), JSON.stringify(proofs), JSON.stringify(client), joinedAt, now,
     );
-    this.sql.exec('UPDATE nodes SET github = ? WHERE node_id = ?', github, nodeId);
+    this.sql.exec('UPDATE nodes SET github = ?, ip24 = ? WHERE node_id = ?', github, net, nodeId);
     this.pubkeys.set(nodeId, pubB64);
-    this.live.set(nodeId, { status: 'idle', activity: null, load: null, last_beat: now, flushed_at: now });
+    this.live.set(nodeId, { status: 'idle', activity: null, load: null, last_beat: now, flushed_at: now, ip24: net });
     const row = this.sql.exec('SELECT * FROM nodes WHERE node_id = ?', nodeId).one();
     this.emit('node', { node_id: nodeId, node: this.publicNode(row, now) });
     return json({ node_id: nodeId, handle, github, roles: finalRoles, proofs, suggested_roles: suggested, beat_ms: this.beatMs });
@@ -510,7 +550,7 @@ export class Swarm {
     const prev = this.live.get(nodeId);
     const wasLeft = prev ? !!prev.left : !!this.sql.exec('SELECT left_at FROM nodes WHERE node_id = ?', nodeId).one().left_at;
     const flush = wasLeft || !prev || now - prev.flushed_at >= FLUSH_MS;
-    this.live.set(nodeId, { status, activity, load, last_beat: now, flushed_at: flush ? now : prev.flushed_at });
+    this.live.set(nodeId, { status, activity, load, last_beat: now, flushed_at: flush ? now : prev.flushed_at, ip24: prev?.ip24 || trust.ip24(v.ip) });
     if (flush) {
       this.sql.exec('UPDATE nodes SET status = ?, activity = ?, load = ?, last_beat = ?, left_at = NULL WHERE node_id = ?',
         status, activity ? JSON.stringify(activity) : null, load ? JSON.stringify(load) : null, now, nodeId);
@@ -545,8 +585,10 @@ export class Swarm {
     const held = this.sql.exec('SELECT COUNT(*) AS n FROM leases WHERE node_id = ? AND closed_at IS NULL AND expires_at >= ?', nodeId, now).one().n;
     if (held >= MAX_LEASES_PER_NODE) return json({ error: 'lease_cap', held, max: MAX_LEASES_PER_NODE }, 429);
     const kinds = Array.isArray(body.kinds) ? body.kinds.filter((k) => UNIT_KINDS.includes(k)) : null;
+    const tier = trust.tierOf(this.sql, nodeId);
+    if (tier === 'quarantined') return json({ error: 'quarantined' }, 403);
     if (tracks.has('A') && role === 'thinker' && (!kinds || kinds.includes('card'))) {
-      const pick = await atlas.pickCardUnit(this.sql, nodeId, now);
+      const pick = await atlas.pickCardUnit(this.sql, nodeId, now, tier);
       if (pick) {
         const leaseId = crypto.randomUUID();
         const expires = now + LEASE_MS;
@@ -602,13 +644,13 @@ export class Swarm {
     const unitRow = this.sql.exec('SELECT * FROM units WHERE id = ?', l.unit_id).toArray()[0];
     if (unitRow?.kind === 'rebuild' && unitRow.track === 'R' && body.verdict !== 'skip') {
       this.sql.exec('UPDATE leases SET closed_at = ? WHERE lease_id = ?', now, l.lease_id);
-      const r = await replay.rebuildResult(this, { lease: l, unit: unitRow, nodeId, body, now });
+      const r = await replay.rebuildResult(this, { lease: l, unit: unitRow, nodeId, body, now, ident: this.ident(v) });
       this.emit('result', { node_id: nodeId, unit_id: l.unit_id, track: 'R', verdict: r.verdict });
       return json({ ok: true, ...r });
     }
     if (unitRow?.kind === 'card' && unitRow.track === 'A' && body.verdict !== 'skip') {
       this.sql.exec('UPDATE leases SET closed_at = ? WHERE lease_id = ?', now, l.lease_id);
-      const r = atlas.cardResult(this, { lease: l, unit: unitRow, nodeId, body, now });
+      const r = atlas.cardResult(this, { lease: l, unit: unitRow, nodeId, body, now, ident: this.ident(v) });
       this.emit('result', { node_id: nodeId, unit_id: l.unit_id, track: 'A', verdict: r.verdict });
       if (r.accepted) this.postAcceptedCards(unitRow.id);
       return json({ ok: true, ...r });
@@ -649,6 +691,13 @@ export class Swarm {
     if (url && key && key.length >= 16) {
       this.bg(fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-rh-proxy-key': key }, body: JSON.stringify({ post }), signal: AbortSignal.timeout(15_000) }));
     }
+  }
+
+  /** Recall hits agents may read: posts from new contributors wait for review. */
+  agentSafe(hits) {
+    const ids = (hits || []).filter((h) => h.type === 'post').map((h) => h.ref);
+    const ok = new Set(ids.length ? board.getPosts(this.sql, { ids, limit: 50 }).filter((p) => p.for_agents).map((p) => p.id) : []);
+    return (hits || []).filter((h) => h.type !== 'post' || ok.has(h.ref));
   }
 
   /** Small in-memory cache for read-heavy public views (rows-read budget). */
@@ -730,6 +779,7 @@ export class Swarm {
       );
       if (extra) this.sql.exec('UPDATE units SET depth = ?, area = ?, payload = ? WHERE id = ?', extra.depth, extra.area, extra.payload, id);
       if (extra && kind === 'card') atlas.indexUnitModules(this.sql, id, extra.payload);
+      this.sql.exec('UPDATE units SET rk = ? WHERE id = ? AND rk IS NULL', Math.random(), id);
       upserted++;
     }
     return json({ ok: true, upserted, rejected });
@@ -819,14 +869,22 @@ export class Swarm {
     const p = url.pathname;
     const m = req.method;
     try {
-      if (m === 'POST' && ['/api/hello', '/api/beat', '/api/lease', '/api/result', '/api/bye', '/api/board', '/api/board/check'].includes(p)) {
+      if (m === 'POST' && ['/api/hello', '/api/beat', '/api/lease', '/api/result', '/api/bye', '/api/board', '/api/board/check', '/api/github/link'].includes(p)) {
         const v = await this.verifySigned(req, p === '/api/hello');
         if (v.err) return v.err;
-        if (p === '/api/hello') return this.hello(v);
+        if (p === '/api/hello') return await this.hello(v);
+        if (p === '/api/github/link') {
+          const r = await trust.verifyGithub(this.env, { nodeId: v.nodeId, pubB64: v.pubB64, login: String(v.body.login || ''), gistId: String(v.body.gist_id || '') }).catch((e) => ({ error: String(e?.message || e).slice(0, 80) }));
+          if (r.error) return json({ error: r.error }, 400);
+          const taken = this.sql.exec('SELECT COUNT(*) AS n FROM nodes WHERE lower(gh_login) = lower(?) AND node_id != ?', r.login, v.nodeId).one().n;
+          this.sql.exec('UPDATE nodes SET gh_login = ?, gh_created_at = ?, github = ? WHERE node_id = ?', r.login, r.created_at, r.login, v.nodeId);
+          const old = r.created_at && Date.now() - r.created_at >= trust.GITHUB_MIN_AGE_DAYS * 86_400_000;
+          return json({ ok: true, login: r.login, created_at: r.created_at, bonus: !!old, other_nodes_same_account: taken });
+        }
         if (p === '/api/beat') return this.beat(v);
         if (p === '/api/lease') return await this.lease(v);
         if (p === '/api/board' || p === '/api/board/check') {
-          const r = p === '/api/board' ? board.createPost(this, v) : board.checkPost(this, v);
+          const r = p === '/api/board' ? board.createPost(this, v) : board.checkPost(this, { ...v, ident: this.ident(v) });
           if (r.error) return json({ error: r.error }, r.status || 400);
           if (p === '/api/board') this.afterPost(r.post);
           return json(r);
@@ -880,11 +938,15 @@ export class Swarm {
           const q = sp.get('q') || sp.get('focus');
           if (q) {
             const r = await recall.recall(this.env, this.sql, q, 8).catch(() => ({ method: 'error', hits: [] }));
-            d.recall = r.hits; d.recall_method = r.method;
+            d.recall = this.agentSafe(r.hits); d.recall_method = r.method;
           }
           return pub(d);
         }
-        if (p === '/api/recall') return pub(await recall.recall(this.env, this.sql, sp.get('q'), Math.min(20, Number(sp.get('k')) || 8)));
+        if (p === '/api/recall') {
+          const r = await recall.recall(this.env, this.sql, sp.get('q'), Math.min(20, Number(sp.get('k')) || 8));
+          return pub({ ...r, hits: this.agentSafe(r.hits) });
+        }
+        if (p === '/api/trust') return pub(this.cached('trust', 60_000, () => trust.trustView(this.sql)));
         if (p === '/api/board/topics') return pub({ topics: board.topics(this.sql) });
         if (p.startsWith('/api/board/post/')) {
           const t = board.thread(this.sql, p.slice('/api/board/post/'.length));
@@ -917,6 +979,22 @@ export class Swarm {
         if (m === 'POST' && (p === '/api/admin/pack' || p === '/api/admin/modules' || p === '/api/admin/atlas')) {
           const r = p === '/api/admin/pack' ? await atlas.adminPack(this.sql, req, url) : p === '/api/admin/modules' ? await atlas.adminModules(this.sql, req) : await atlas.adminAtlas(this.sql, req);
           return r.error ? json({ error: r.error }, r.status || 400) : json(r);
+        }
+        if (m === 'POST' && p === '/api/admin/nodes/tier') {
+          const b = await req.json().catch(() => null);
+          const tier = ['new', 'established', 'trusted'].includes(b?.tier) ? b.tier : null;
+          if (!tier || typeof b?.node_id !== 'string') return json({ error: 'node_id_and_tier_required' }, 400);
+          const r = this.sql.exec('UPDATE nodes SET tier = ?, quarantined_at = CASE WHEN ? THEN NULL ELSE quarantined_at END WHERE node_id = ? RETURNING node_id, tier', tier, b.unquarantine ? 1 : 0, b.node_id).toArray();
+          this.cache?.delete('trust');
+          return json({ ok: true, updated: r });
+        }
+        if (m === 'DELETE' && p === '/api/admin/units') {
+          const id = String(url.searchParams.get('id') || '');
+          if (!id) return json({ error: 'id_required' }, 400);
+          this.sql.exec('DELETE FROM cards WHERE unit_id = ?', id);
+          this.sql.exec('DELETE FROM unit_modules WHERE unit_id = ?', id);
+          const n = this.sql.exec('DELETE FROM units WHERE id = ? RETURNING id', id).toArray().length;
+          return json({ ok: true, deleted: n });
         }
         if (m === 'DELETE' && p === '/api/admin/nodes') {
           const handle = String(url.searchParams.get('handle') || '').trim();

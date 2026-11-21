@@ -14,6 +14,7 @@
  * Accepted receipts appear on the board as findings labelled ⛓.
  */
 import * as board from './board.js';
+import * as trust from './trust.js';
 
 export const ARCHIVE_SHA256 = '9631b4f020199e580ba86178cb56c6e9b09f690c2369a80dc4334aa93f49c7fc';
 export const TOOLCHAIN = 'leanprover/lean4:v4.33.1';
@@ -104,25 +105,36 @@ async function hashOf(mods) {
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function rebuildResult(sw, { lease, unit, nodeId, body, now }) {
+export async function rebuildResult(sw, { lease, unit, nodeId, body, now, ident }) {
   const sql = sw.sql;
   const p = parseJ(unit.payload, null);
   const c = p ? cleanReceipt(body.receipt, p) : { err: 'no_payload' };
   if (c.err) {
-    sql.exec('INSERT INTO receipts (unit_id, node_id, lease_id, at, ok, olean_hash, receipt, status) VALUES (?, ?, ?, ?, 0, NULL, ?, ?)',
-      unit.id, nodeId, lease.lease_id, now, JSON.stringify({ error: c.err }), 'invalid');
+    sql.exec('INSERT INTO receipts (unit_id, node_id, lease_id, at, ok, olean_hash, receipt, status, ip24, gh_login) VALUES (?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)',
+      unit.id, nodeId, lease.lease_id, now, JSON.stringify({ error: c.err }), 'invalid', ident?.ip24 || 'unknown', ident?.gh || null);
     return { verdict: 'fail', status: 'invalid', reason: c.err };
   }
   const r = c.receipt;
   const ok = r.lake_exit === 0 && r.leanchecker_exit === 0;
   const h = ok ? await hashOf(r.modules) : null;
-  sql.exec('INSERT INTO receipts (unit_id, node_id, lease_id, at, ok, olean_hash, receipt, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    unit.id, nodeId, lease.lease_id, now, ok ? 1 : 0, h, JSON.stringify(r), 'pending');
+  sql.exec('INSERT INTO receipts (unit_id, node_id, lease_id, at, ok, olean_hash, receipt, status, ip24, gh_login) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    unit.id, nodeId, lease.lease_id, now, ok ? 1 : 0, h, JSON.stringify(r), 'pending', ident?.ip24 || 'unknown', ident?.gh || null);
   const others = sql.exec("SELECT * FROM receipts WHERE unit_id = ? AND node_id != ? AND status = 'pending' ORDER BY id", unit.id, nodeId).toArray();
-  const mine = sql.exec("SELECT id FROM receipts WHERE unit_id = ? AND node_id = ? ORDER BY id DESC LIMIT 1", unit.id, nodeId).one().id;
+  const mineRow = sql.exec("SELECT * FROM receipts WHERE unit_id = ? AND node_id = ? ORDER BY id DESC LIMIT 1", unit.id, nodeId).one();
+  const mine = mineRow.id;
   if (ok) {
-    const partner = others.find((o) => o.ok && o.olean_hash === h);
+    // Quorum: an identical olean set from an independent node, and at least
+    // one of the two established or trusted. One person's two machines are not a quorum.
+    const tierMap = trust.tiers(sql, [nodeId, ...others.map((o) => o.node_id)]);
+    const strong = (id) => tierMap[id] === 'established' || tierMap[id] === 'trusted';
+    const same = others.filter((o) => o.ok && o.olean_hash === h && tierMap[o.node_id] !== 'quarantined');
+    const partner = same.find((o) => trust.independent(trust.who(o), trust.who(mineRow)) && (strong(o.node_id) || strong(nodeId)));
+    if (!partner && same.length) {
+      sw.emit('receipt', { unit_id: unit.id, node_id: nodeId, accepted: false, waiting: 'independent established node' });
+      return { verdict: 'pending', status: 'valid', accepted: false, olean_hash: h, needs: 'an identical receipt from an independent node, one of the two established or trusted' };
+    }
     if (partner) {
+      trust.recordOutcomes(sql, [partner.node_id, nodeId], []);
       sql.exec("UPDATE receipts SET status = 'agreed' WHERE id IN (?, ?)", partner.id, mine);
       sql.exec("UPDATE units SET state = 'done', updated_at = ? WHERE id = ?", now, unit.id);
       const short = r.packet.length > 1 ? `${r.packet[0].split('.').slice(-1)[0]} +${r.packet.length - 1}` : r.packet[0].split('.').slice(-2).join('.');
@@ -140,7 +152,7 @@ export async function rebuildResult(sw, { lease, unit, nodeId, body, now }) {
       return { verdict: 'ok', status: 'valid', accepted: true, olean_hash: h };
     }
   }
-  const conflict = others.length > 0 || !ok;
+  const conflict = others.some((o) => trust.independent(trust.who(o), trust.who(mineRow))) || !ok;
   if (conflict) {
     sql.exec("UPDATE receipts SET status = 'superseded' WHERE unit_id = ? AND status = 'pending'", unit.id);
     sql.exec(`UPDATE units SET attempts = attempts + 1, state = CASE WHEN attempts + 1 >= ? THEN 'gap' ELSE 'open' END, updated_at = ? WHERE id = ?`, MAX_ATTEMPTS, now, unit.id);

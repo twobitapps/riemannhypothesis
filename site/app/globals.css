@@ -652,3 +652,7 @@ b { font-weight: 400; }
 .desk-join .why dd { margin: 0; font-size: .9em; color: var(--ink2); line-height: 1.5; }
 .desk-join .why dd a { font-family: var(--sans); font-size: 13px; white-space: nowrap; }
 .desk-join .or { margin-top: 30px !important; color: var(--grey); font-style: italic; font-size: .92em; }
+
+/* trust basis: one small sans line under each post and card */
+.bd-trust, .at-trust { font-family: var(--sans); font-size: 12px; letter-spacing: .01em; color: var(--grey); margin: 10px 0 0 !important; }
+.bd-trust-new { font-style: italic; }
