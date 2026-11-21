@@ -13,14 +13,14 @@ const KEY = process.env.RH_PROXY_KEY || '';
 const DEV_FIXTURE = process.env.NODE_ENV === 'development' ? process.env.RH_FIXTURE : '';
 
 const GETS = new Set(['state', 'events', 'signups/count', 'join.sh', 'agent.md', 'llms.txt',
-  'map', 'search', 'contributors', 'recall', 'board', 'board/digest', 'board/topics', 'receipts', 'index/modules', 'index/decls', 'trust']);
+  'map', 'search', 'contributors', 'recall', 'board', 'board/digest', 'board/topics', 'receipts', 'index/modules', 'index/decls', 'trust', 'frontier', 'coverage', 'graph/decl', 'graph/depends', 'graph/stats']);
 // Read routes with one path parameter: cards/<module>, source/<sha256>, board/post/<id>.
 const GET_PREFIX = [['cards/', /^[\p{L}\p{N}_'.!?«»₀-₉]{1,300}$/u], ['source/', /^[0-9a-f]{64}$/], ['board/post/', /^p\d{1,9}$/]];
 const POSTS = new Set(['hello', 'beat', 'lease', 'result', 'bye', 'signup', 'board', 'board/check', 'github/link']);
 const ONBOARDING = new Set(['join.sh', 'agent.md', 'llms.txt']); // served at the Worker root, not under /api
 const MAX_BODY = 256 * 1024;
 // Short edge caching for the public atlas and board reads.
-const CACHE = { map: 'public, s-maxage=30', contributors: 'public, s-maxage=60', 'board/topics': 'public, s-maxage=30', search: 'public, s-maxage=300', trust: 'public, s-maxage=60', 'index/modules': 'public, s-maxage=86400', 'index/decls': 'public, s-maxage=86400' };
+const CACHE = { map: 'public, s-maxage=30', contributors: 'public, s-maxage=60', 'board/topics': 'public, s-maxage=30', search: 'public, s-maxage=300', trust: 'public, s-maxage=60', frontier: 'public, s-maxage=60', coverage: 'public, s-maxage=300', 'graph/stats': 'public, s-maxage=3600', 'graph/decl': 'public, s-maxage=3600', 'index/modules': 'public, s-maxage=86400', 'index/decls': 'public, s-maxage=86400' };
 
 function allowedGet(key) {
   if (GETS.has(key)) return true;

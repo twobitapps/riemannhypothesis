@@ -111,20 +111,20 @@ async function appendToBranch(token, repo, branch, files, message) {
   if (ref.ok) {
     parent = ref.j.object.sha;
     const c = await gh(token, 'GET', `/repos/${repo}/git/commits/${parent}`);
-    if (!c.ok) throw new Error(`commit ${c.status}`);
+    if (!c.ok) throw new Error(`get commit ${c.status}: ${c.j.message || ''}`);
     baseTree = c.j.tree.sha;
-  } else if (ref.status !== 404) throw new Error(`ref ${ref.status}`);
+  } else if (ref.status !== 404) throw new Error(`get ref ${ref.status}: ${ref.j.message || ''}`);
   const tree = await gh(token, 'POST', `/repos/${repo}/git/trees`, {
     ...(baseTree ? { base_tree: baseTree } : {}),
     tree: files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })),
   });
-  if (!tree.ok) throw new Error(`tree ${tree.status}`);
+  if (!tree.ok) throw new Error(`create tree ${tree.status}: ${tree.j.message || ''}`);
   const commit = await gh(token, 'POST', `/repos/${repo}/git/commits`, { message, tree: tree.j.sha, parents: parent ? [parent] : [] });
-  if (!commit.ok) throw new Error(`commit ${commit.status}`);
+  if (!commit.ok) throw new Error(`create commit ${commit.status}: ${commit.j.message || ''}`);
   const up = parent
     ? await gh(token, 'PATCH', `/repos/${repo}/git/refs/heads/${branch}`, { sha: commit.j.sha, force: false })
     : await gh(token, 'POST', `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.j.sha });
-  if (!up.ok) throw new Error(`ref update ${up.status}`);
+  if (!up.ok) throw new Error(`update ref ${up.status}: ${up.j.message || ''}`);
   return { calls: parent ? 5 : 4, commit: commit.j.sha };
 }
 
@@ -151,14 +151,18 @@ export async function exportLedger(sw, opts = {}) {
   const token = env.GITHUB_LEDGER_TOKEN || '';
   const dry = opts.dryRun || env.LEDGER_DRY_RUN === '1' || !token;
   if (dry) return { dry_run: true, reason: !token ? 'GITHUB_LEDGER_TOKEN is not set' : 'dry run', plan };
-  const targets = [env.LEDGER_REPO || 'twobitapps/riemannhypothesis'];
+  let targets = [env.LEDGER_REPO || 'twobitapps/riemannhypothesis'];
   if (env.LEDGER_MIRROR_AGI === '1' && env.LEDGER_MIRROR_REPO) targets.push(env.LEDGER_MIRROR_REPO);
+  // A hand-checked first write can name one target: canonical or mirror.
+  if (opts.target === 'canonical') targets = targets.slice(0, 1);
+  if (opts.target === 'mirror') targets = targets.slice(1);
+  if (!targets.length) return { error: 'no such target configured' };
   const done = [];
   let calls = 0;
   for (const repo of targets) {
     for (const b of plan.branches) {
       if (!b.files.length) continue;
-      const r = await appendToBranch(token, repo, b.branch, b.files, `riemann: ${b.files.length} signed artifact(s), ${hour}`);
+      const r = await appendToBranch(token, repo, b.branch, b.files, `riemann: ${b.files.length} signed artifact(s), ${hour}`).catch((e) => { throw new Error(`${repo} ${b.branch}: ${e.message}`); });
       calls += r.calls; done.push({ repo, branch: b.branch, files: b.files.length, commit: r.commit });
     }
     if (!opts.only && roll.length) {

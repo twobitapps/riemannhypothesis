@@ -313,7 +313,8 @@ export function cardResult(sw, { lease, unit, nodeId, body, now, ident }) {
   const submitted = Array.isArray(body.cards) ? body.cards : [];
   let status = 'valid', reason = null;
   const cards = [], names = {};
-  if (!p) { status = 'invalid'; reason = 'no_payload'; }
+  if (typeof body.discarded === 'string') { status = 'invalid'; reason = `discarded:${body.discarded.slice(0, 120)}`; }
+  else if (!p) { status = 'invalid'; reason = 'no_payload'; }
   else if (submitted.length !== p.modules.length) { status = 'invalid'; reason = 'card_count'; }
   else {
     for (const m of p.modules) {

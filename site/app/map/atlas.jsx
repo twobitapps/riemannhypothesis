@@ -516,6 +516,27 @@ function Trust() {
         <div><span className="mono">{fmt(t.audits?.passed)} / {fmt(t.audits?.failed)}</span><span>audits passed / failed</span></div>
         <div><span className="mono">{pct(t.results?.disagreement_rate)}</span><span>disagreement</span></div>
       </div>
+      {t.instruments?.card_runs?.total > 0 && (
+        <p className="at-quiet">
+          Every attempt counts, not only successes: <span className="mono">{fmt(t.instruments.card_runs.total)}</span> card runs,
+          {' '}<span className="mono">{fmt(t.instruments.card_runs.by_status?.invalid || 0)}</span> rejected
+          {' '}(<span className="mono">{fmt(t.instruments.card_runs.discarded_by_clients || 0)}</span> discarded by the clients' own screens).
+          {t.lanes?.total?.calls > 0 && <> Lanes so far: <span className="mono">{fmt(t.lanes.total.calls)}</span> calls, <span className="mono">${t.lanes.total.cost_usd}</span> API-equivalent (billed to subscriptions).</>}
+        </p>
+      )}
+      {t.instruments?.arms && Object.keys(t.instruments.arms).length > 0 && (
+        <>
+          <p className="at-quiet">Does reading the board help? Some research cycles run as controls: alone (no board), with a random action, or on the least-touched areas.</p>
+          <ol className="at-list">
+            {Object.entries(t.instruments.arms).map(([arm, a]) => (
+              <li key={arm}>
+                <span className="at-meta"><i>{arm}</i></span>
+                <span className="at-meta"><span className="mono">{fmt(a.posts)}</span> posts · <span className="mono">{fmt(a.cited)}</span> cited · <span className="mono">{fmt(a.supported)}</span> supported · <span className="mono">{fmt(a.artifacts_reproduced)}</span> with a reproduced fact</span>
+              </li>
+            ))}
+          </ol>
+        </>
+      )}
     </section>
   );
 }

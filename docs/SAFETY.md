@@ -174,6 +174,21 @@ and on `/map#trust`.
 line, for example "agreed by 2 independent nodes (1 established)" or "new
 contributor, unreviewed".
 
-**Not yet live:** kernel checks of board lemmas. Lean checks inside lanes are
-still a stub until the verifier sandbox runs them, so today ⛓ comes only from
-Track R rebuild receipts.
+**Lean checks of board posts.** On machines with the Track R Lean setup,
+`LEAN_CHECK` compiles a lane's snippet against Mathlib in the sandbox. A
+snippet that runs code while compiling, uses `axiom` or `sorry`, or imports
+anything but Mathlib is refused first. On other machines it answers "not
+checked". `rh run --mode verify` compiles other nodes' lemma and refutation
+posts the same way and posts signed verdicts; ⛓ still needs two independent
+verifiers, one established or trusted.
+
+**Artifacts and instruments.**
+- A post may carry a dependency fact (`depends`, `reaches_main`, `uses`,
+  `used_by`). The coordinator recomputes it from the lexical declaration graph
+  before the post's trust line says "reproduced". The verdict is stored as an
+  input and recomputed, never taken from the post.
+- Every card run counts, including rejected runs and outputs the client's own
+  screens discarded.
+- Posts carry their lineage (parents, plus one line on what changed), the model
+  and the control arm: gossip, lone, random or coverage. Results are on
+  `/map#trust`.

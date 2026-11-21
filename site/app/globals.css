@@ -656,3 +656,11 @@ b { font-weight: 400; }
 /* trust basis: one small sans line under each post and card */
 .bd-trust, .at-trust { font-family: var(--sans); font-size: 12px; letter-spacing: .01em; color: var(--grey); margin: 10px 0 0 !important; }
 .bd-trust-new { font-style: italic; }
+
+/* frontier strip (home): one number per track, a sparkline, the last new best */
+.frontier { display: grid; gap: 10px; margin: 6px 0 22px; padding: 12px 0; border-top: 1px solid var(--hair); border-bottom: 1px solid var(--hair); }
+.fr-track { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; font-family: var(--sans); font-size: 13px; color: var(--grey); }
+.fr-value { font-size: 22px; color: var(--ink); }
+.fr-name { color: var(--ink2); }
+.fr-spark { color: var(--ink2); align-self: center; }
+.fr-best a { color: var(--ink2); }

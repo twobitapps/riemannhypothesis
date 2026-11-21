@@ -27,7 +27,8 @@
 import { screenText } from './atlas.js';
 import * as trust from './trust.js';
 
-export const POST_KINDS = ['question', 'finding', 'card', 'lemma', 'refutation', 'synthesis', 'stuck', 'plan', 'answer'];
+export const POST_KINDS = ['question', 'finding', 'card', 'lemma', 'refutation', 'synthesis', 'stuck', 'plan', 'answer', 'best'];
+const ARMS = ['gossip', 'lone', 'random', 'coverage'];
 const STANCES = ['supports', 'disputes'];
 const LIMITS = { title: 100, body: 1500, lean: 6000, refs: 16, ref: 300 };
 const POSTS_PER_HOUR = 60;
@@ -82,6 +83,7 @@ export function initBoard(sql) {
   const cols = sql.exec('PRAGMA table_info(posts)').toArray().map((c) => c.name);
   if (!cols.includes('topic')) sql.exec('ALTER TABLE posts ADD COLUMN topic TEXT');
   if (!cols.includes('fixed_label')) sql.exec('ALTER TABLE posts ADD COLUMN fixed_label TEXT');
+  for (const c of ['lineage', 'arm', 'model', 'artifact', 'artifact_ok']) if (!cols.includes(c)) sql.exec(`ALTER TABLE posts ADD COLUMN ${c} TEXT`);
   const ccols = sql.exec('PRAGMA table_info(post_checks)').toArray().map((c) => c.name);
   if (!ccols.includes('ip24')) sql.exec('ALTER TABLE post_checks ADD COLUMN ip24 TEXT');
   if (!ccols.includes('gh_login')) sql.exec('ALTER TABLE post_checks ADD COLUMN gh_login TEXT');
@@ -99,6 +101,7 @@ export function createPost(sw, v, { seed = false, derived = false, fixedLabel = 
   const { body, nodeId, now } = v;
   const kind = POST_KINDS.includes(body.kind) ? body.kind : null;
   if (!kind) return { error: 'bad_kind', status: 400 };
+  if ((kind === 'card' || kind === 'best') && !derived && !seed) return { error: 'kind_reserved', status: 400 };
   const title = clean(body.title, LIMITS.title + 1);
   const text = clean(body.body, LIMITS.body + 1);
   if (!title || title.length > LIMITS.title) return { error: 'bad_title', status: 400 };
@@ -111,6 +114,19 @@ export function createPost(sw, v, { seed = false, derived = false, fixedLabel = 
   }
   if ((kind === 'lemma' || kind === 'refutation') && !lean) return { error: 'lean_required', status: 400 };
   const stance = body.stance == null ? null : STANCES.includes(body.stance) ? body.stance : undefined;
+  // Instruments: lineage (parents + one line on what changed), control arm, model.
+  const lin = body.lineage && typeof body.lineage === 'object' ? body.lineage : null;
+  const lineage = lin ? { parents: (Array.isArray(lin.parents) ? lin.parents : []).filter((x) => typeof x === 'string').slice(0, 16).map((x) => x.slice(0, 300)), changed: clean(lin.changed, 200) } : null;
+  const arm = ARMS.includes(body.arm) ? body.arm : null;
+  const model = typeof body.model === 'string' ? body.model.replace(/[^A-Za-z0-9._:\-]/g, '').slice(0, 64) || null : null;
+  // Artifact: a dependency fact from the lexical graph, recomputed by the
+  // coordinator before it counts (see graph.js). Lean snippets travel in `lean`.
+  let artifact = null;
+  if (body.artifact && typeof body.artifact === 'object') {
+    const a = body.artifact;
+    if (!['depends', 'reaches_main', 'uses', 'used_by'].includes(a.op) || typeof a.a !== 'string' || (a.op === 'depends' && typeof a.b !== 'string')) return { error: 'bad_artifact', status: 400 };
+    artifact = { op: a.op, a: a.a.slice(0, 300), ...(a.b ? { b: String(a.b).slice(0, 300) } : {}), claim: a.claim === false ? false : true };
+  }
   if (stance === undefined) return { error: 'bad_stance', status: 400 };
   const refsIn = Array.isArray(body.refs) ? body.refs : [];
   if (refsIn.length > LIMITS.refs) return { error: 'too_many_refs', status: 400 };
@@ -142,8 +158,9 @@ export function createPost(sw, v, { seed = false, derived = false, fixedLabel = 
   const seq = sql.exec('SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM posts').one().s;
   const id = `p${seq}`;
   sql.exec(
-    `INSERT INTO posts (seq, id, node_id, kind, refs, title, body, lean, stance, ts, at, raw, sig, seed, topic, fixed_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO posts (seq, id, node_id, kind, refs, title, body, lean, stance, ts, at, raw, sig, seed, topic, fixed_label, lineage, arm, model, artifact) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     seq, id, nodeId, kind, JSON.stringify(refs), title, text, lean, stance, Number(body.ts) || now, now, v.raw || null, v.sig || null, seed ? 1 : 0, topic, fixedLabel,
+    lineage ? JSON.stringify(lineage) : null, arm, model, artifact ? JSON.stringify(artifact) : null,
   );
   if (topic) {
     sql.exec('INSERT INTO topics (slug, founder, title, at, posts) VALUES (?, ?, ?, ?, 0) ON CONFLICT(slug) DO NOTHING', topic, nodeId, title, now);
@@ -264,7 +281,8 @@ function shape(sql, rows, now = Date.now()) {
       refs, node_id: r.node_id,
       author: r.seed ? { handle: 'coordinator', github: null } : String(r.node_id).startsWith('ext:') ? { handle: r.node_id.slice(4), github: null, via: 'vercel-board' } : who[r.node_id] || { handle: null, github: null },
       seed: !!r.seed, at: r.at, label, mark: label ? LABEL_MARK[label] : null,
-      tier, new_contributor: newContributor, trust: trustLine,
+      tier, new_contributor: newContributor, trust: r.artifact_ok === '1' && !label ? `${trustLine} · dependency fact reproduced (lexical graph)` : trustLine,
+      lineage: parseJ(r.lineage, null), arm: r.arm || null, model: r.model || null, artifact: parseJ(r.artifact, null), artifact_ok: r.artifact_ok == null ? null : r.artifact_ok === '1',
       for_agents: tier !== 'quarantined' && (!newContributor || s.endorsed),
       cites: s.cites, replies: s.replies, supports: s.supports, disputes: s.disputes, kernel_ok: s.kernel_ok, kernel_fail: s.kernel_fail,
       score: Math.round(score * 1000) / 1000,

@@ -685,7 +685,8 @@ async function doCardUnit(ctx) {
   if (why) {
     logCall({ kind: 'card-screen', unit: r.unit.id, ok: false, reason: why });
     log(`card ${r.unit.id}: discarded (${why})`);
-    await signed(id, '/result', { lease_id: r.lease_id, unit_id: r.unit.id, verdict: 'fail', summary: why.slice(0, 200) }).catch(() => {});
+    await signed(id, '/result', { lease_id: r.lease_id, unit_id: r.unit.id, verdict: 'fail', discarded: why.slice(0, 120), summary: why.slice(0, 200) }).catch(() => {});
+    const sd = loadState(); sd.counters = { ...(sd.counters || {}), discarded: ((sd.counters || {}).discarded || 0) + 1 }; saveState(sd);
     note({ action: 'card', unit: r.unit.id, ok: false, why });
     return { done: true, ok: false, why };
   }
@@ -704,7 +705,11 @@ const TOOL_SPEC = `Tools (the client runs them for you; you have no shell, files
 - {"tool": "READ_MODULE", "arg": "<Lean module name>", "from_line": <optional int>}  source of a module (about 120 lines per read)
 - {"tool": "SEARCH_SOURCE", "arg": "<substring, >=3 chars>"}  declaration and module names containing it (case-insensitive)
 - {"tool": "BOARD_SEARCH", "arg": "<question or keywords>"}  earlier posts and accepted cards, most relevant first
-- {"tool": "LEAN_CHECK", "arg": "<Lean snippet>"}  NOT AVAILABLE YET: the sandbox has not landed; returns "not checked"
+- {"tool": "USES", "arg": "<declaration name>"}  declarations it mentions, whether it reaches Main, and a path to Main (lexical graph, approximate)
+- {"tool": "REACHES_MAIN", "arg": "<declaration name>"}  same as USES, read for its reaches-Main answer
+- {"tool": "USED_BY", "arg": "<declaration name>"}  declarations that mention it
+- {"tool": "DEPENDS", "arg": "<declaration A>", "b": "<declaration B>"}  does A (transitively) mention B? with a path
+- {"tool": "LEAN_CHECK", "arg": "<Lean snippet using Mathlib>"}  compiles it in a sandbox on machines that have Lean; otherwise says it was not checked
 Each turn, reply with JSON only: either {"requests": [up to 3 tool calls]} or {"final": <the result object asked for>}. At most ${MAX_TURNS} turns.`;
 
 async function getJson(route) {
@@ -789,7 +794,23 @@ async function runTool(t) {
         const r = await getJson(`/recall?q=${encodeURIComponent(arg.slice(0, 400))}&k=8`);
         return (r.hits.map((h) => h.type === 'post' ? `[${h.ref}] ${h.kind}: ${h.title} — ${h.text}` : `[card ${h.ref}] ${h.text}`).join('\n') || 'no matches').slice(0, TOOL_RESULT_MAX);
       }
-      case 'LEAN_CHECK': return 'NOT CHECKED: Lean checking is not available yet (the sandbox has not landed). Do not claim this snippet compiles.';
+      case 'LEAN_CHECK': { const r = await leanCheck(arg); return r.ran ? `${r.ok ? 'COMPILED (exit 0)' : `FAILED (exit ${r.code})`}\n${r.out}` : `NOT CHECKED: ${r.why}. Do not claim this snippet compiles.`; }
+      case 'USES':
+      case 'REACHES_MAIN': {
+        const d = await getJson(`/graph/decl?name=${encodeURIComponent(arg.trim())}`);
+        if (d.error) return `error: ${d.error}`;
+        return `[${d.label}] ${d.kind} ${d.name} in ${d.module}\nreaches Main: ${d.reaches_main}${d.path_to_main ? `\npath to Main: ${d.path_to_main.join(' → ')}` : ''}\nuses (${d.uses_total}): ${d.uses.map((x) => x.name).join(', ')}`.slice(0, TOOL_RESULT_MAX);
+      }
+      case 'USED_BY': {
+        const d = await getJson(`/graph/decl?name=${encodeURIComponent(arg.trim())}`);
+        if (d.error) return `error: ${d.error}`;
+        return `[${d.label}] ${d.name} is used by ${d.used_by_total}: ${d.used_by.map((x) => `${x.name} (${x.module})`).join(', ')}`.slice(0, TOOL_RESULT_MAX);
+      }
+      case 'DEPENDS': {
+        const d = await getJson(`/graph/depends?a=${encodeURIComponent(arg.trim())}&b=${encodeURIComponent(String(t.b || '').trim())}`);
+        if (d.error) return `error: ${d.error}`;
+        return `[${d.label}] ${d.a} depends on ${d.b}: ${d.depends}${d.path ? `\npath: ${d.path.join(' → ')}` : ''}`;
+      }
       default: return 'error: unknown tool';
     }
   } catch (e) { return `error: ${e.message}`.slice(0, 300); }
@@ -833,12 +854,21 @@ function cleanPost(p, { citeDefault = [] } = {}) {
   const topic = typeof p.topic === 'string' && /^[a-z0-9][a-z0-9-]{1,47}$/.test(p.topic) ? p.topic : undefined;
   const bad = screen([title, body, lean || ''].join('\n'));
   if (bad) return { err: `screened: contains ${bad}` };
-  return { post: { kind, title, body, refs, ...(lean ? { lean } : {}), ...(stance ? { stance } : {}), ...(topic ? { topic } : {}) } };
+  // Artifact: a dependency fact the coordinator recomputes from the lexical graph.
+  let artifact;
+  if (p.artifact && typeof p.artifact === 'object' && ['depends', 'reaches_main', 'uses', 'used_by'].includes(p.artifact.op) && typeof p.artifact.a === 'string') {
+    artifact = { op: p.artifact.op, a: p.artifact.a.slice(0, 300), ...(typeof p.artifact.b === 'string' ? { b: p.artifact.b.slice(0, 300) } : {}), claim: p.artifact.claim !== false };
+  }
+  const changed = typeof p.changed === 'string' ? p.changed.trim().slice(0, 200) : '';
+  const lineage = { parents: refs.filter((x) => /^p\d+$/.test(x)), changed: changed || null };
+  return { post: { kind, title, body, refs, lineage, ...(lean ? { lean } : {}), ...(stance ? { stance } : {}), ...(topic ? { topic } : {}), ...(artifact ? { artifact } : {}) } };
 }
 
 async function post(ctx, p, citeDefault) {
   const c = cleanPost(p, { citeDefault });
   if (c.err) { log(`post discarded (${c.err})`); return null; }
+  c.post.arm = ctx.arm || 'gossip';
+  if (ctx.model) c.post.model = ctx.model;
   try {
     const r = await signed(ctx.id, '/board', c.post);
     log(`posted ${r.id} [${c.post.kind}] ${c.post.title}`);
@@ -853,7 +883,7 @@ async function post(ctx, p, citeDefault) {
   }
 }
 
-const POST_SHAPE = '{"kind": "finding"|"answer"|"stuck"|"synthesis"|"lemma"|"refutation", "title": "a complete phrase of at most 90 characters, never cut off", "body": "<=1500 chars, plain text, $...$ for math", "refs": ["module names and post ids (p12) you built on"], "stance": "supports"|"disputes" (optional, toward cited posts), "lean": "only for lemma/refutation"}';
+const POST_SHAPE = '{"kind": "finding"|"answer"|"stuck"|"synthesis"|"lemma"|"refutation", "title": "a complete phrase of at most 90 characters, never cut off", "body": "<=1500 chars, plain text, $...$ for math", "refs": ["module names and post ids (p12) you built on"], "changed": "one line: what this adds to what it builds on", "artifact": {"op": "depends"|"reaches_main"|"uses"|"used_by", "a": "<declaration>", "b": "<declaration, for depends/uses/used_by>", "claim": true|false} (a dependency fact the coordinator will recompute; include one whenever your claim is about what uses what), "stance": "supports"|"disputes" (optional, toward cited posts), "lean": "a Lean snippet (example/#check) for lemma/refutation"}. Posts without an artifact or Lean stay unmarked claims.';
 
 function digestText(d) {
   const line = (p) => `[${p.id}] ${p.kind}${p.label ? ` (${p.label})` : ''} by ${p.by || '?'}: ${p.title} — ${p.body.slice(0, 220)}${p.refs?.length ? ` refs: ${p.refs.slice(0, 4).join(', ')}` : ''} (cited ${p.cites}, replies ${p.replies})`;
@@ -969,10 +999,31 @@ async function doSynthesize(ctx, target) {
 
 /** One autoresearcher cycle: read the board, plan, act, post, note. */
 async function researchCycle(ctx) {
-  const focus = ctx.focus || '';
-  const d = await getJson(`/board/digest?focus=${encodeURIComponent(focus)}${focus ? '' : '&q=open%20questions%20about%20the%20proof%20structure'}`);
+  // Control arms, so "does the gossip help?" is measurable: 10% lone (no board
+  // digest), 20% random action, 15% coverage (focus on a least-touched area),
+  // the rest gossip (read the board, plan). Every post records its arm.
+  const roll = Math.random();
+  ctx.arm = ctx.action ? 'gossip' : roll < 0.10 ? 'lone' : roll < 0.30 ? 'random' : roll < 0.45 ? 'coverage' : 'gossip';
+  let focus = ctx.focus || '';
+  if (ctx.arm === 'coverage') {
+    const cov = await getJson('/coverage').catch(() => null);
+    const list = cov?.least_touched || [];
+    if (list.length) focus = list[Math.floor(Math.random() * Math.min(10, list.length))].area;
+  }
+  const d = ctx.arm === 'lone' ? { cards_total: 0, open_questions: [], top: [], stuck: [], cards: [], recall: [] }
+    : await getJson(`/board/digest?focus=${encodeURIComponent(focus)}${focus ? '' : '&q=open%20questions%20about%20the%20proof%20structure'}`);
+  const s0 = loadState(); s0.counters = { ...(s0.counters || {}), cycles: ((s0.counters || {}).cycles || 0) + 1 }; saveState(s0);
+  const randomPick = () => {
+    const a = ACTIONS[Math.floor(Math.random() * ACTIONS.length)];
+    const posts = [...(d.open_questions || []), ...(d.top || []), ...(d.stuck || [])];
+    const target = a === 'synthesize' ? null : a === 'card' ? null : posts.length ? posts[Math.floor(Math.random() * posts.length)].id : null;
+    return { action: a, target, why: 'control arm: random action' };
+  };
   // A person can direct one cycle (--action card|investigate|verify|synthesize [--target x]); otherwise the lane plans.
-  const pl = ctx.action ? { action: ctx.action, target: ctx.target || null, why: 'directed by the person running this node' } : await plan(ctx, d);
+  const pl = ctx.action ? { action: ctx.action, target: ctx.target || null, why: 'directed by the person running this node' }
+    : ctx.arm === 'random' ? randomPick() : await plan(ctx, d);
+  ctx.model = pl.model || ctx.model || null;
+  log(`arm ${ctx.arm}${focus ? ` · focus ${focus}` : ''}`);
   log(`plan: ${pl.action}${pl.target ? ` ${pl.target}` : ''} — ${pl.why}`);
   note({ action: 'plan', chose: pl.action, target: pl.target, why: pl.why, digest_posts: (d.top || []).length });
   let r;
@@ -1171,6 +1222,50 @@ async function doRebuild(ctx) {
   } finally { ctx.status = 'idle'; }
 }
 
+/**
+ * LEAN_CHECK on machines with the Track R setup: compile one snippet against
+ * Mathlib in the sandbox (no network, writes only to the project's src and .lake).
+ * Code that runs while compiling, axioms and sorry are refused first.
+ */
+async function leanCheck(snippet) {
+  const st = loadState();
+  const setup = rebuildSetup(st);
+  if (setup.why) return { ran: false, why: `Lean is not set up on this machine (${setup.why})` };
+  const src = String(snippet || '').slice(0, 6000);
+  const bad = [...R_LINT, [/^\s*axiom\b/m, 'axiom'], [/\bsorry\b/, 'sorry'], [/^\s*import\s+(?!Mathlib\b)/m, 'imports other than Mathlib']].filter(([re]) => re.test(src)).map(([, w]) => w);
+  if (bad.length) return { ran: true, ok: false, code: -1, out: `refused by lint: ${bad.join(', ')}` };
+  const body = /^\s*import\s+Mathlib/m.test(src) ? src : `import Mathlib\n\n${src}`;
+  const name = `RhCheck${crypto.createHash('sha256').update(body).digest('hex').slice(0, 12)}`;
+  const file = path.join(st.r_project, 'src', `${name}.lean`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+  try {
+    const lake = path.join(setup.toolchain, 'bin', 'lake');
+    const r = await runSandboxed(lake, ['env', 'lean', file], { cwd: st.r_project, project: st.r_project, toolchain: setup.toolchain, timeoutMs: 10 * 60_000 });
+    return { ran: true, ok: r.code === 0, code: r.code, out: r.out.replace(new RegExp(st.r_project.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '<project>').slice(-2000) };
+  } finally { fs.rmSync(file, { force: true }); }
+}
+
+/** Verifier: check lemma and refutation posts in the Lean sandbox and report signed verdicts. */
+async function doVerifyLean(ctx) {
+  const st = loadState();
+  if (rebuildSetup(st).why) return { done: false, why: 'no Lean setup' };
+  const { posts } = await getJson('/board?kind=lemma&limit=30');
+  const ref = await getJson('/board?kind=refutation&limit=30');
+  for (const p of [...posts, ...ref.posts]) {
+    if (!p.lean || p.node_id === ctx.id.nodeId) continue;
+    if ((st.checked || []).includes(p.id)) continue;
+    log(`kernel check of ${p.id} (${p.kind})`);
+    const r = await leanCheck(p.lean);
+    const s2 = loadState(); s2.checked = [...(s2.checked || []), p.id].slice(-2000); saveState(s2);
+    if (!r.ran) return { done: false, why: r.why };
+    await signed(ctx.id, '/board/check', { post_id: p.id, verdict: r.ok ? 'ok' : 'fail', sandboxed: true, linted: true, detail: r.ok ? 'compiled with exit 0' : String(r.out).slice(-300) });
+    note({ action: 'kernel-check', post: p.id, ok: r.ok });
+    return { done: true, ok: r.ok };
+  }
+  return { done: false, why: 'no unchecked lemma or refutation posts' };
+}
+
 /** rh r-selftest <Module> [...]: build modules from the local archive in the sandbox, no coordinator. */
 async function cmdRSelftest(args) {
   ensureDirs();
@@ -1287,11 +1382,11 @@ async function cmdRun(args) {
   const beatMs = Math.max(5000, Number(st.beat_ms) || 20000);
   const maxBeats = args.beats ? Number(args.beats) : Infinity;
   const maxCycles = args.cycles ? Number(args.cycles) : Infinity;
-  const mode = ['cards', 'rebuild'].includes(args.mode) ? args.mode : 'research';
+  const mode = ['cards', 'rebuild', 'verify'].includes(args.mode) ? args.mode : 'research';
   const roles = st.roles || [];
   const ctx = { id, handle: st.handle, focus: typeof args.focus === 'string' ? args.focus : st.focus || '', activity: null, status: 'idle',
     action: ACTIONS.includes(args.action) ? args.action : null, target: typeof args.target === 'string' ? args.target : null };
-  const canWork = mode === 'rebuild' ? roles.includes('verifier') : roles.includes('thinker') && probeLanes().claude;
+  const canWork = mode === 'rebuild' || mode === 'verify' ? roles.includes('verifier') : roles.includes('thinker') && probeLanes().claude;
   let beats = 0, cycles = 0, stopping = false, wake = null, lastGateLog = '';
   const stop = () => { stopping = true; log('stopping after the current step (no bye sent; run `node rh.mjs bye` to leave)'); wake?.(); };
   process.on('SIGINT', stop);
@@ -1313,11 +1408,11 @@ async function cmdRun(args) {
   await beat();
 
   while (!stopping && beats < maxBeats && cycles < maxCycles) {
-    const why = canWork ? gate(loadState(), mode === 'rebuild') : 'no lane';
+    const why = canWork ? gate(loadState(), mode === 'rebuild' || mode === 'verify') : 'no lane';
     if (canWork && !why) {
       ctx.status = 'thinking';
       try {
-        const r = mode === 'cards' ? await doCardUnit(ctx) : mode === 'rebuild' ? await doRebuild(ctx) : await researchCycle(ctx);
+        const r = mode === 'cards' ? await doCardUnit(ctx) : mode === 'rebuild' ? await doRebuild(ctx) : mode === 'verify' ? await doVerifyLean(ctx) : await researchCycle(ctx);
         if (r.done) cycles++;
         else { log(`nothing to do (${r.why}); waiting`); await sleepWake(60_000, (w) => { wake = w; }); }
       } catch (e) {

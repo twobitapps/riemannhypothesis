@@ -19,6 +19,8 @@ import { handleSignups } from './signups.js';
 import { searchModules } from './search.js';
 import * as trust from './trust.js';
 import * as ledger from './ledger.js';
+import * as graph from './graph.js';
+import * as frontier from './frontier.js';
 
 const DEFAULT_BEAT_MS = 20_000;
 const TS_WINDOW_MS = 5 * 60_000;
@@ -35,7 +37,7 @@ const NODES_LISTED_MS = 7 * 24 * 3600_000;
 // memory. Node rows are flushed at most once per node per FLUSH_MS (and on
 // hello/bye); leases, results, cards and posts are rows. See PROTOCOL.md.
 const FLUSH_MS = 10 * 60_000;
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 11;
 
 const ROLES = ['thinker', 'verifier', 'anchor', 'canary', 'finisher', 'prover', 'atlas'];
 const STATUSES = ['idle', 'preparing', 'thinking', 'checking', 'verifying', 'building', 'seeding', 'paused'];
@@ -319,6 +321,7 @@ export class Swarm {
       this.reevaluate();
     }
     if (v < 9) ledger.initLedger(this.sql);
+    if (v < 10) graph.initGraph(this.sql);
     if (v < 7) {
       const nc = this.sql.exec('PRAGMA table_info(nodes)').toArray().map((c) => c.name);
       if (!nc.includes('counters')) this.sql.exec('ALTER TABLE nodes ADD COLUMN counters TEXT');
@@ -668,6 +671,7 @@ export class Swarm {
       this.sql.exec('UPDATE leases SET closed_at = ? WHERE lease_id = ?', now, l.lease_id);
       const r = await replay.rebuildResult(this, { lease: l, unit: unitRow, nodeId, body, now, ident: this.ident(v) });
       this.sql.exec('UPDATE receipts SET raw = ?, sig = ? WHERE lease_id = ?', v.raw, v.sig, l.lease_id);
+      if (r.accepted) this.bg(frontier.maybePostBest(this));
       this.emit('result', { node_id: nodeId, unit_id: l.unit_id, track: 'R', verdict: r.verdict });
       return json({ ok: true, ...r });
     }
@@ -676,7 +680,7 @@ export class Swarm {
       const r = atlas.cardResult(this, { lease: l, unit: unitRow, nodeId, body, now, ident: this.ident(v) });
       this.sql.exec('UPDATE card_runs SET raw = ?, sig = ? WHERE lease_id = ?', v.raw, v.sig, l.lease_id);
       this.emit('result', { node_id: nodeId, unit_id: l.unit_id, track: 'A', verdict: r.verdict });
-      if (r.accepted) this.postAcceptedCards(unitRow.id);
+      if (r.accepted) { this.postAcceptedCards(unitRow.id); this.bg(frontier.maybePostBest(this)); }
       return json({ ok: true, ...r });
     }
     const verdict = pick(body.verdict, VERDICTS);
@@ -715,6 +719,56 @@ export class Swarm {
     if (url && key && key.length >= 16) {
       this.bg(fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-rh-proxy-key': key }, body: JSON.stringify({ post }), signal: AbortSignal.timeout(15_000) }));
     }
+  }
+
+  /** Recompute a post's dependency fact from the lexical graph; store the verdict as its input changes, never trust the claim. */
+  async checkArtifact(post) {
+    const a = post.artifact;
+    let truth = null;
+    try {
+      if (a.op === 'depends') { const r = await graph.depends(this, a.a, a.b); truth = r.depends === true ? true : r.depends === false ? false : null; }
+      else {
+        const d = await graph.declView(this, a.a);
+        if (!d.error) {
+          if (a.op === 'reaches_main') truth = d.reaches_main;
+          else if (a.op === 'uses') truth = d.uses.some((x) => x.name === a.b);
+          else if (a.op === 'used_by') truth = d.used_by.some((x) => x.name === a.b);
+        }
+      }
+    } catch { truth = null; }
+    const ok = truth == null ? null : truth === (a.claim !== false);
+    this.sql.exec('UPDATE posts SET artifact_ok = ? WHERE id = ?', ok == null ? null : ok ? '1' : '0', post.id);
+    post.artifact_ok = ok;
+  }
+
+  /** Least-touched areas (cards, runs and posts per module), for the coverage arm. */
+  coverage() {
+    const meta = parseJ(this.sql.exec("SELECT v FROM atlas_meta WHERE k = 'meta'").toArray()[0]?.v, { areas: [] });
+    const touch = {};
+    for (const r of this.sql.exec("SELECT u.area AS area, COUNT(*) AS n FROM card_runs c JOIN units u ON u.id = c.unit_id GROUP BY u.area").toArray()) touch[r.area] = (touch[r.area] || 0) + r.n;
+    for (const r of this.sql.exec('SELECT ref FROM post_refs WHERE is_post = 0').toArray()) {
+      const p = String(r.ref).split('.');
+      const area = p.length > 2 ? p.slice(0, 2).join('.') : p[0];
+      touch[area] = (touch[area] || 0) + 1;
+    }
+    const areas = meta.areas.filter((a) => a.modules >= 20).map((a) => ({ area: a.area, modules: a.modules, touches: touch[a.area] || 0, per_100_modules: Math.round(((touch[a.area] || 0) / a.modules) * 10000) / 100 }));
+    areas.sort((x, y) => x.per_100_modules - y.per_100_modules || y.modules - x.modules);
+    return { least_touched: areas.slice(0, 25), most_touched: [...areas].reverse().slice(0, 10), areas: areas.length };
+  }
+
+  /** Attempts (all of them, not only successes) and control-arm outcomes. */
+  instruments() {
+    const runs = {};
+    for (const r of this.sql.exec('SELECT status, COUNT(*) AS n FROM card_runs GROUP BY status').toArray()) runs[r.status] = r.n;
+    const discarded = this.sql.exec("SELECT COUNT(*) AS n FROM card_runs WHERE reason LIKE 'discarded:%'").one().n;
+    const arms = {};
+    const posts = this.sql.exec('SELECT id, arm FROM posts WHERE arm IS NOT NULL').toArray();
+    const shaped = posts.length ? board.getPosts(this.sql, { ids: posts.map((p) => p.id), limit: 200 }) : [];
+    for (const p of shaped) {
+      const a = (arms[p.arm] ||= { posts: 0, cited: 0, supported: 0, disputed: 0, artifacts_reproduced: 0 });
+      a.posts++; if (p.cites) a.cited++; if (p.supports) a.supported++; if (p.disputes) a.disputed++; if (p.artifact_ok) a.artifacts_reproduced++;
+    }
+    return { card_runs: { total: Object.values(runs).reduce((s, n) => s + n, 0), by_status: runs, discarded_by_clients: discarded }, arms };
   }
 
   /** Swarm-wide lane totals (self-reported by clients): calls, tokens, API-equivalent cost; per node and overall. */
@@ -924,7 +978,10 @@ export class Swarm {
         if (p === '/api/board' || p === '/api/board/check') {
           const r = p === '/api/board' ? board.createPost(this, v) : board.checkPost(this, { ...v, ident: this.ident(v) });
           if (r.error) return json({ error: r.error }, r.status || 400);
-          if (p === '/api/board') this.afterPost(r.post);
+          if (p === '/api/board') {
+            if (r.post?.artifact) await this.checkArtifact(r.post);
+            this.afterPost(r.post);
+          }
           return json(r);
         }
         if (p === '/api/result') return await this.result(v);
@@ -984,7 +1041,12 @@ export class Swarm {
           const r = await recall.recall(this.env, this.sql, sp.get('q'), Math.min(20, Number(sp.get('k')) || 8));
           return pub({ ...r, hits: this.agentSafe(r.hits) });
         }
-        if (p === '/api/trust') return pub(this.cached('trust', 60_000, () => ({ ...trust.trustView(this.sql), lanes: this.laneTotals() })));
+        if (p === '/api/graph/decl') return pub(await graph.declView(this, sp.get('name')));
+        if (p === '/api/graph/depends') return pub(await graph.depends(this, sp.get('a'), sp.get('b')));
+        if (p === '/api/graph/stats') { this.graphStats ||= await graph.stats(this); if (this.graphStats.error) { const e = this.graphStats; this.graphStats = null; return pub(e, 404); } return pub(this.graphStats); }
+        if (p === '/api/trust') return pub(this.cached('trust', 60_000, () => ({ ...trust.trustView(this.sql), lanes: this.laneTotals(), instruments: this.instruments() })));
+        if (p === '/api/frontier') { const c = this.cache?.get('frontier'); if (c && Date.now() - c.at < 60_000) return pub(c.v); const v = await frontier.frontier(this); (this.cache ||= new Map()).set('frontier', { at: Date.now(), v }); return pub(v); }
+        if (p === '/api/coverage') return pub(this.cached('coverage', 300_000, () => this.coverage()));
         if (p === '/api/board/topics') return pub({ topics: board.topics(this.sql) });
         if (p.startsWith('/api/board/post/')) {
           const t = board.thread(this.sql, p.slice('/api/board/post/'.length));
@@ -1008,7 +1070,7 @@ export class Swarm {
         if (m === 'POST' && p === '/api/admin/units') return await this.adminUnits(req);
         if (m === 'POST' && p === '/api/admin/blob') {
           const name = url.searchParams.get('name'), part = Number(url.searchParams.get('part')), parts = Number(url.searchParams.get('parts'));
-          if (!/^(modules|decls)$/.test(name || '') || !Number.isInteger(part) || !Number.isInteger(parts) || part < 0 || part >= parts || parts > 20) return json({ error: 'bad_blob' }, 400);
+          if (!/^(modules|decls|declofs|reach|graphmeta)$/.test(name || '') || !Number.isInteger(part) || !Number.isInteger(parts) || part < 0 || part >= parts || parts > 20) return json({ error: 'bad_blob' }, 400);
           const buf = new Uint8Array(await req.arrayBuffer());
           if (!buf.length || buf.length > 1_900_000) return json({ error: 'bad_size' }, 413);
           this.sql.exec('INSERT INTO blobs (name, part, parts, data) VALUES (?, ?, ?, ?) ON CONFLICT(name, part) DO UPDATE SET parts = excluded.parts, data = excluded.data', name, part, parts, buf);
@@ -1019,10 +1081,15 @@ export class Swarm {
           return r.error ? json({ error: r.error }, r.status || 400) : json(r);
         }
         if (m === 'GET' && p === '/api/admin/health') {
-          return json({ init_error: this.initError || null, schema: this.sql.exec("SELECT v FROM schema_meta WHERE k = 'version'").toArray()[0]?.v ?? null });
+          return json({ ledger_token: typeof this.env.GITHUB_LEDGER_TOKEN === 'string' ? (this.env.GITHUB_LEDGER_TOKEN.trim().length ? 'set' : 'empty string') : 'missing', mirror_repo: typeof this.env.LEDGER_MIRROR_REPO === 'string' && this.env.LEDGER_MIRROR_REPO.length > 0 ? 'set' : 'missing', init_error: this.initError || null, schema: this.sql.exec("SELECT v FROM schema_meta WHERE k = 'version'").toArray()[0]?.v ?? null });
+        }
+        if (m === 'POST' && (p === '/api/admin/moddeps' || p === '/api/admin/declnames')) {
+          const b = await req.json().catch(() => null);
+          this.graphArrays = null; this.graphStats = null;
+          return json(p === '/api/admin/moddeps' ? graph.adminModDeps(this.sql, b) : graph.adminDeclNames(this.sql, b));
         }
         if (m === 'POST' && p === '/api/admin/ledger') {
-          const r = await ledger.exportLedger(this, { dryRun: url.searchParams.get('dry') === '1', only: url.searchParams.get('only') || null })
+          const r = await ledger.exportLedger(this, { dryRun: url.searchParams.get('dry') === '1', only: url.searchParams.get('only') || null, target: url.searchParams.get('target') || null })
             .catch((e) => ({ error: String(e?.message || e).slice(0, 200) }));
           return json(r, r.error ? 500 : 200);
         }
