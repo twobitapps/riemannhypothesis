@@ -7,3 +7,10 @@ coordinator/public/
 .env*
 !.env.example
 .DS_Store
+
+# Pilot findings held back until the author has seen them
+lean/pilot/logs/
+lean/pilot/proofs/
+lean/pilot/Pilot/U/
+lean/pilot/Pilot/RT/
+blueprint/pilot.json
