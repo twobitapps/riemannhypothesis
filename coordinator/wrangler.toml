@@ -26,6 +26,13 @@ BEAT_MS = "20000"
 RH_PUBLIC_API = "https://riemannhypothesis.vercel.app/api/rh"
 # 1 = non-admin /api/* calls must arrive through the proxy (x-rh-proxy-key).
 REQUIRE_PROXY = "1"
+# The public record (coordinator/src/ledger.js): canonical repo for the
+# riemann/agents/<node> and riemann/ledger branches. Writes need the secret
+# GITHUB_LEDGER_TOKEN; the hourly job runs only with LEDGER_HOURLY = "1".
+# An optional mirror repo is a secret (LEDGER_MIRROR_REPO) plus LEDGER_MIRROR_AGI = "1".
+LEDGER_REPO = "twobitapps/riemannhypothesis"
+LEDGER_HOURLY = "0"
+LEDGER_MIRROR_AGI = "1"
 # Optional mirror of new board posts to the team's Vercel Board (the site route
 # acts only when its RH_VERCEL_BOARD=1). Empty disables the call.
 RH_MIRROR_URL = "https://riemannhypothesis.vercel.app/api/vboard"
@@ -47,3 +54,6 @@ index_name = "riemann-recall"
 binding = "SIGNUPS"
 database_name = "riemann-signups"
 database_id = "f4cd3e6c-6306-4ba1-84a3-3ef6a17df52b"
+
+[triggers]
+crons = ["17 * * * *"]

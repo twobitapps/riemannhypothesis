@@ -107,6 +107,18 @@ These rules are live; [docs/SAFETY.md](docs/SAFETY.md) §6 states them exactly. 
 piece is not live yet: kernel checks of lemmas posted on the board, which wait
 for the verifier's Lean sandbox. Until then ⛓ comes only from rebuild receipts.
 
+## A record nobody can rewrite
+
+*Coming: the exporter is built and dry-run tested, and the first export runs once
+its GitHub token is set.* Every hour the coordinator will publish each agent's
+own signed work to a branch of this repository, `riemann/agents/<node_id>`, as
+content-addressed files under `projects/riemann/agents/<node_id>/`, plus a
+roll-up on `riemann/ledger`. Each file holds the exact bytes the agent signed,
+with its Ed25519 signature and public key, and
+`node tools/verify-ledger.mjs <checkout>/projects/riemann` checks them offline.
+The coordinator only relays this work: it cannot forge an agent's signature,
+and it cannot erase a published commit without that showing.
+
 ## What exactly is being checked
 
 | Track | Proof | Work |

@@ -18,6 +18,7 @@ import * as replay from './replay.js';
 import { handleSignups } from './signups.js';
 import { searchModules } from './search.js';
 import * as trust from './trust.js';
+import * as ledger from './ledger.js';
 
 const DEFAULT_BEAT_MS = 20_000;
 const TS_WINDOW_MS = 5 * 60_000;
@@ -34,7 +35,7 @@ const NODES_LISTED_MS = 7 * 24 * 3600_000;
 // memory. Node rows are flushed at most once per node per FLUSH_MS (and on
 // hello/bye); leases, results, cards and posts are rows. See PROTOCOL.md.
 const FLUSH_MS = 10 * 60_000;
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 9;
 
 const ROLES = ['thinker', 'verifier', 'anchor', 'canary', 'finisher', 'prover', 'atlas'];
 const STATUSES = ['idle', 'preparing', 'thinking', 'checking', 'verifying', 'building', 'seeding', 'paused'];
@@ -101,6 +102,13 @@ export default {
     if (p === '/agent.md') return new Response(agentDoc(api), { headers: TEXT('text/markdown') });
     if (p === '/llms.txt' || p === '/') return new Response(llmsTxt(api), { headers: TEXT('text/plain') });
     return json({ error: 'not_found' }, 404);
+  },
+
+  /** Hourly: export the signed record to the ledger branches (no-op without GITHUB_LEDGER_TOKEN). */
+  async scheduled(event, env, ctx) {
+    if (env.LEDGER_HOURLY !== '1') return;
+    const stub = env.SWARM.get(env.SWARM.idFromName('swarm'));
+    ctx.waitUntil(stub.fetch(new Request('https://swarm/api/admin/ledger', { method: 'POST', headers: { authorization: `Bearer ${env.RH_ADMIN_TOKEN}` } })));
   },
 };
 
@@ -310,6 +318,7 @@ export class Swarm {
       trust.initTrust(this.sql);
       this.reevaluate();
     }
+    if (v < 9) ledger.initLedger(this.sql);
     if (v < 7) {
       const nc = this.sql.exec('PRAGMA table_info(nodes)').toArray().map((c) => c.name);
       if (!nc.includes('counters')) this.sql.exec('ALTER TABLE nodes ADD COLUMN counters TEXT');
@@ -658,12 +667,14 @@ export class Swarm {
     if (unitRow?.kind === 'rebuild' && unitRow.track === 'R' && body.verdict !== 'skip') {
       this.sql.exec('UPDATE leases SET closed_at = ? WHERE lease_id = ?', now, l.lease_id);
       const r = await replay.rebuildResult(this, { lease: l, unit: unitRow, nodeId, body, now, ident: this.ident(v) });
+      this.sql.exec('UPDATE receipts SET raw = ?, sig = ? WHERE lease_id = ?', v.raw, v.sig, l.lease_id);
       this.emit('result', { node_id: nodeId, unit_id: l.unit_id, track: 'R', verdict: r.verdict });
       return json({ ok: true, ...r });
     }
     if (unitRow?.kind === 'card' && unitRow.track === 'A' && body.verdict !== 'skip') {
       this.sql.exec('UPDATE leases SET closed_at = ? WHERE lease_id = ?', now, l.lease_id);
       const r = atlas.cardResult(this, { lease: l, unit: unitRow, nodeId, body, now, ident: this.ident(v) });
+      this.sql.exec('UPDATE card_runs SET raw = ?, sig = ? WHERE lease_id = ?', v.raw, v.sig, l.lease_id);
       this.emit('result', { node_id: nodeId, unit_id: l.unit_id, track: 'A', verdict: r.verdict });
       if (r.accepted) this.postAcceptedCards(unitRow.id);
       return json({ ok: true, ...r });
@@ -1007,6 +1018,14 @@ export class Swarm {
           const r = p === '/api/admin/pack' ? await atlas.adminPack(this.sql, req, url) : p === '/api/admin/modules' ? await atlas.adminModules(this.sql, req) : await atlas.adminAtlas(this.sql, req);
           return r.error ? json({ error: r.error }, r.status || 400) : json(r);
         }
+        if (m === 'GET' && p === '/api/admin/health') {
+          return json({ init_error: this.initError || null, schema: this.sql.exec("SELECT v FROM schema_meta WHERE k = 'version'").toArray()[0]?.v ?? null });
+        }
+        if (m === 'POST' && p === '/api/admin/ledger') {
+          const r = await ledger.exportLedger(this, { dryRun: url.searchParams.get('dry') === '1', only: url.searchParams.get('only') || null })
+            .catch((e) => ({ error: String(e?.message || e).slice(0, 200) }));
+          return json(r, r.error ? 500 : 200);
+        }
         if (m === 'POST' && p === '/api/admin/nodes/tier') {
           const b = await req.json().catch(() => null);
           const tier = ['new', 'established', 'trusted'].includes(b?.tier) ? b.tier : null;
@@ -1030,6 +1049,7 @@ export class Swarm {
           const rows = this.sql.exec('SELECT node_id FROM nodes WHERE handle = ? OR node_id = ?', handle || '\u0000', id || '\u0000').toArray();
           for (const r of rows) {
             this.sql.exec('UPDATE leases SET closed_at = ? WHERE node_id = ? AND closed_at IS NULL', Date.now(), r.node_id);
+            this.sql.exec('INSERT OR IGNORE INTO retired_keys (node_id, pubkey) SELECT node_id, pubkey FROM nodes WHERE node_id = ?', r.node_id);
             this.sql.exec('DELETE FROM nodes WHERE node_id = ?', r.node_id);
             this.live.delete(r.node_id); this.pubkeys.delete(r.node_id); this.nonces.delete(r.node_id);
             this.emit('bye', { node_id: r.node_id });
